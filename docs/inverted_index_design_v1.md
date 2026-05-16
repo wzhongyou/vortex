@@ -1,33 +1,33 @@
-# 倒排索引 V1 设计
+# Inverted Index V1 Design
 
-## 1. 目标与范围
+## 1. Goals & Scope
 
-实现工业级单机倒排索引。核心对标 Lucene 的段（Segment）架构，从第一天起以生产可交付标准设计数据结构和算法。
+Implement a production-grade single-node inverted index. The core architecture is modeled after Lucene's Segment design, with data structures and algorithms designed from day one for production deliverables.
 
-### 1.1 V1 交付
+### 1.1 V1 Deliverables
 
-- Term / AND / OR / NOT 布尔查询
-- BM25F 字段加权相关性打分，插件化 Scorer
-- 按 Field 独立建索引
-- 段（Segment）架构：内存写入 → Flush 不可变磁盘段
-- 快照隔离：RCU 保护读路径，写不阻塞读
-- 二进制 WAL，CRC32 校验，Group Commit
-- mmap 零拷贝磁盘读取
-- FST 词典 + SIMD-BP128 块编码倒排链
-- Arena 内存分配，全链路可控
-- 所有磁盘文件带校验和
-- 查询延迟、索引吞吐度可观测
+- Term / AND / OR / NOT boolean queries
+- BM25F field-weighted relevance scoring, pluggable Scorer
+- Per-field indexing
+- Segment architecture: in-memory writes → flush to immutable on-disk segments
+- Snapshot isolation: RCU-protected read path, writes never block reads
+- Binary WAL, CRC32 checksum, Group Commit
+- mmap zero-copy disk reads
+- FST dictionary + SIMD-BP128 block-encoded posting lists
+- Arena-based memory allocation, fully controllable
+- Checksums on all disk files
+- Observable query latency and indexing throughput
 
-### 1.2 V1 不做
+### 1.2 V1 Out of Scope
 
-段合并、短语查询、NRT 近实时搜索、分布式。
+Segment merging, phrase queries, NRT (near-real-time) search, distributed.
 
-## 2. 错误处理模型
+## 2. Error Handling Model
 
-工业搜索引擎不允许异常满天飞。采用分层错误策略：
+A production search engine cannot tolerate exceptions everywhere. A layered error strategy is used:
 
 ```cpp
-// 库不抛异常，使用 Status 返回
+// Library code never throws; uses Status return
 class Status {
 public:
     enum Code : uint8_t {
@@ -52,39 +52,39 @@ public:
 
 private:
     Code code_;
-    std::string msg_;  // 小字符串优化，不额外分配
+    std::string msg_;  // small-string optimization, no extra allocation
 };
 
-// 只有真正的 unrecoverable 才用 panic
+// VORTEX_PANIC only for truly unrecoverable errors
 #define VORTEX_PANIC(msg) \
     do { std::cerr << "[PANIC] " << msg << std::endl; std::abort(); } while(0)
 ```
 
-规则：
-- API 边界：返回 `Status` 或 `Result<T>`，不抛异常
-- 内部辅助函数：允许 `VORTEX_PANIC` 处理 invariant 破坏（逻辑 bug，不是运行时错误）
-- 构造函数只用 `VORTEX_PANIC`，工厂方法用 `Result<T>`
+Rules:
+- API boundaries: return `Status` or `Result<T>`, never throw
+- Internal helpers: `VORTEX_PANIC` is allowed for invariant violations (logic bugs, not runtime errors)
+- Constructors: use `VORTEX_PANIC` only; factory methods use `Result<T>`
 
-## 3. 内存管理
+## 3. Memory Management
 
 ### 3.1 Arena Allocator
 
-建索引阶段，99% 的分配是临时的（分词 token、内存段 postings、FST 构建中间态）。直接用 `new/malloc` 会导致分配器锁竞争和碎片。
+During indexing, 99% of allocations are temporary (tokens, in-memory segment postings, FST build intermediates). Using `new/malloc` directly leads to allocator lock contention and fragmentation.
 
 ```
-策略：分层 Arena
+Strategy: Layered Arenas
 
-IndexWriter 拥有:
-  active_arena_       ← 内存段当前使用，flush 后整体释放
-  flush_arena_        ← 正在 flush 的段（双缓冲，避免 flush 阻塞写入）
+IndexWriter owns:
+  active_arena_       ← used by current in-memory segment, bulk-reset after flush
+  flush_arena_        ← segment being flushed (double-buffered to avoid blocking writes)
 
-每个请求绑定一个 ThreadLocalArena (256KB slab 链式增长)
-  - Analyzer 的 token 输出分配在此
-  - 请求结束整体释放
+Each request binds a ThreadLocalArena (256KB slab chain growth):
+  - Analyzer token output allocated here
+  - bulk-reset on request completion
 
-FST 构建使用独立的 2-pass Arena：
-  - Pass 1: 收集所有 term → 建立 minimal FST 节点图
-  - Pass 2: 序列化到 byte array，释放 pass 1 临时数据
+FST construction uses an independent 2-pass Arena:
+  - Pass 1: collect all terms → build minimal FST node graph
+  - Pass 2: serialize to byte array, free pass 1 temporary data
 ```
 
 ```cpp
@@ -93,7 +93,7 @@ public:
     explicit Arena(size_t chunk_size = 256 * 1024);
 
     void* allocate(size_t size, size_t alignment = alignof(std::max_align_t));
-    void reset();  // 保留当前 chunk，重置使用位置
+    void reset();  // retain current chunk, reset usage pointer
 
     size_t allocated() const;
     size_t wasted() const;
@@ -110,37 +110,37 @@ private:
     size_t chunk_size_;
 };
 
-// RAII 绑定 arena 到当前线程
+// RAII binding of arena to current thread
 class ScopedThreadArena {
 public:
-    ScopedThreadArena(Arena& arena);   // 绑定
-    ~ScopedThreadArena();              // 自动解绑 + reset
+    ScopedThreadArena(Arena& arena);   // bind
+    ~ScopedThreadArena();              // auto unbind + reset
 };
 ```
 
-### 3.2 磁盘文件预分配
+### 3.2 Disk File Preallocation
 
 ```cpp
-// .doc / .fst / .store 在开始写入前 fallocate
-// 避免逐步 append 导致的文件碎片和 inode 更新开销
+// .doc / .fst / .store files are fallocated before writing
+// avoids fragmentation and inode update overhead from incremental appends
 void prealloc_file(int fd, off_t estimated_size);
 ```
 
-## 4. 数据模型
+## 4. Data Model
 
 ### 4.1 Schema
 
 ```cpp
 enum class FieldType : uint8_t {
-    TEXT,       // 全文索引 + 分词
-    KEYWORD,    // 精确匹配，不分词
+    TEXT,       // full-text indexed + tokenized
+    KEYWORD,    // exact match, no tokenization
 };
 
 struct FieldSchema {
     std::string name;
     FieldType type;
-    bool stored;     // 原始值存储
-    bool indexed;    // 建倒排索引
+    bool stored;     // raw value stored
+    bool indexed;    // added to inverted index
 };
 
 struct Schema {
@@ -148,7 +148,7 @@ struct Schema {
     const FieldSchema* field(std::string_view name) const;
 
     std::vector<FieldSchema> fields;
-    // 用于 O(1) 按名查 field_index
+    // O(1) field_index lookup by name
     absl::flat_hash_map<std::string, uint16_t> name_to_index;
 };
 ```
@@ -158,7 +158,7 @@ struct Schema {
 ```cpp
 struct FieldValue {
     std::string name;
-    std::string value;  // V1 统一文本
+    std::string value;  // V1: text only
 };
 
 struct Document {
@@ -166,25 +166,25 @@ struct Document {
 };
 ```
 
-Document 不带外部 id。id 由 IndexWriter 内部分配（密集递增 uint32），外部 id 通过 KEYWORD stored field 自行管理。
+Documents carry no external ID. IDs are assigned internally by IndexWriter (dense, monotonically increasing uint32). External IDs are managed by the application via a KEYWORD stored field.
 
-### 4.3 内部文档表示
+### 4.3 Internal Document Representation
 
 ```cpp
 struct InternalDoc {
-    uint64_t segment_id;   // 段 id
-    uint32_t doc_id;       // 段内密集 id（0,1,2,...）
-    uint32_t doc_length;   // 总 term 数
-    // field_index → term 数
+    uint64_t segment_id;   // segment id
+    uint32_t doc_id;       // dense id within segment (0, 1, 2, ...)
+    uint32_t doc_length;   // total term count
+    // field_index → term count
     uint32_t field_lengths[/*field_count*/];
-    // stored field values，按 field_index 索引
+    // stored field values, indexed by field_index
     std::string_view stored_values[/*stored_field_count*/];
 };
 ```
 
-## 5. 段架构
+## 5. Segment Architecture
 
-### 5.1 整体结构
+### 5.1 Overall Structure
 
 ```
 ┌──────────────────────────────────────────────────────┐
@@ -216,133 +216,133 @@ struct InternalDoc {
         └───────────────────────┘
 ```
 
-### 5.2 Segment 磁盘文件
+### 5.2 Segment On-Disk Files
 
 ```
 Segment N
-├── _N.fst       FST 词典: term → {doc_freq, posting_offset, posting_len}
-├── _N.doc       倒排数据: [block_header][SIMD-packed delta_doc_ids][freqs]
-├── _N.pos       词位置数据 (V2 短语查询用)
-├── _N.store     行式文档存储: doc_id → stored_fields
-├── _N.fwd       正排索引: doc_id → field_lengths, doc_length
-├── _N.meta      JSON 元信息
-└── _N.del       删除位图 (roaring bitmap)
+├── _N.fst       FST dictionary: term → {doc_freq, posting_offset, posting_len}
+├── _N.doc       Posting data: [block_header][SIMD-packed delta_doc_ids][freqs]
+├── _N.pos       Position data (V2 phrase queries)
+├── _N.store     Row-oriented doc store: doc_id → stored_fields
+├── _N.fwd       Forward index: doc_id → field_lengths, doc_length
+├── _N.meta      JSON metadata
+└── _N.del       Deletion bitmap (roaring bitmap)
 ```
 
-每个数据文件尾部写 8 字节 xxHash64 校验和。加载时校验，不匹配则拒绝该段并记录 CORRUPT_INDEX。
+Each data file ends with an 8-byte xxHash64 checksum. On load, files are validated and rejected on mismatch with a CORRUPT_INDEX error.
 
-### 5.3 写路径
+### 5.3 Write Path
 
 ```
 add_document(doc):
-  1. 分配段内 doc_id
-  2. WAL::append_add(internal_id, doc)  ← 先写 WAL
-  3. 每个 TEXT field: Tokenizer → [TokenFilter...] → 统计 tf
-  4. 写入内存段的 FST Builder 和 PostingListBuilder
-  5. 更新正排信息
-  6. 更新全局统计（avgdl 等）
-  7. 内存段达到阈值 → flush()
+  1. Allocate segment-local doc_id
+  2. WAL::append_add(internal_id, doc)  ← WAL first
+  3. For each TEXT field: Tokenizer → [TokenFilter...] → collect tf
+  4. Write into in-memory FST Builder and PostingListBuilder
+  5. Update forward-index info
+  6. Update global statistics (avgdl, etc.)
+  7. In-memory segment reaches threshold → flush()
 
 flush():
-  1. 计算各文件预估大小，fallocate
-  2. 写入 .fst / .doc / .store / .fwd / .meta
-  3. 每个文件尾部写入 xxHash64
-  4. fsync 所有文件
-  5. 原子注册新段到 SegmentManager（RCU 更新）
+  1. Estimate file sizes, fallocate
+  2. Write .fst / .doc / .store / .fwd / .meta
+  3. Write xxHash64 tail per file
+  4. fsync all files
+  5. Atomically register new segment with SegmentManager (RCU update)
   6. WAL::truncate()
-  7. 释放 active_arena_ → 新建空内存段
+  7. Release active_arena_ → create new empty in-memory segment
 ```
 
-### 5.4 读路径（无锁）
+### 5.4 Read Path (Lock-Free)
 
 ```
 IndexReader::open():
-  1. 从 SegmentManager 获取 segments snapshot（RCU load）
-  2. mmap 各段的 .fst 和 .doc（首次使用时）
-  3. 校验文件头 magic + 尾 xxHash64
+  1. Acquire segments snapshot from SegmentManager (RCU load)
+  2. mmap each segment's .fst and .doc (on first use)
+  3. Validate file header magic + tail xxHash64
 
 IndexReader::search(query, topk):
-  1. 对每个段独立执行：段内查询 + 打分
-  2. 跨段用小顶堆（topk size）多路归并
-  3. 返回全局 topk，每结果含 segment_id + 段内 doc_id
+  1. Execute per segment independently: intra-segment query + scoring
+  2. Cross-segment k-way merge via min-heap (topk size)
+  3. Return global topk, each result carrying segment_id + intra-segment doc_id
 ```
 
-## 6. 并发模型
+## 6. Concurrency Model
 
-### 6.1 RCU 保护段列表
+### 6.1 RCU-Protected Segment List
 
-`std::shared_mutex` + `vector<shared_ptr<Segment>>` 的问题：每次 `snapshot()` 需要拷贝 vector + atomic inc/dec。高 QPS 下不可视。
+`std::shared_mutex` + `vector<shared_ptr<Segment>>` has a problem: every `snapshot()` requires copying the vector + atomic inc/dec, which is not viable under high QPS.
 
-改用 RCU 风格：
+Switch to an RCU style:
 
 ```cpp
 class SegmentList {
 public:
-    // 读路径：零锁，仅 load(acquire)
-    // 返回裸指针，生命周期由 epoch-based 回收保证
+    // Read path: zero-lock, just load(acquire)
+    // Returns raw pointer; lifetime guaranteed by epoch-based reclamation
     const Segments* snapshot() const {
         return head_.load(std::memory_order_acquire);
     }
 
-    // 写路径：copy → 修改 → 原子 swap
-    // 旧版本延迟释放（等到所有读者离开当前 epoch）
+    // Write path: copy → modify → atomic swap
+    // Old version deallocated lazily (after all readers exit current epoch)
     void register_segment(std::shared_ptr<const Segment> seg);
 
 private:
     struct Segments {
-        uint32_t ref_count{0};  // 活跃 reader 数（epoch tracking）
+        uint32_t ref_count{0};  // active reader count (epoch tracking)
         std::vector<std::shared_ptr<const Segment>> segments;
     };
     std::atomic<Segments*> head_;
 
-    // 退休列表，延迟回收
+    // Retired list for deferred reclamation
     std::mutex retire_mutex_;
     std::vector<Segments*> retired_;
 };
 ```
 
-读路径算法：
+Read path algorithm:
 ```
 reader_enter_epoch():
   atomic_fetch_add(&head_->ref_count, 1)
 
 reader_search():
-  segs = snapshot()  // 裸指针
+  segs = snapshot()  // raw pointer
   for seg in segs->segments: do_search(seg)
 
 reader_exit_epoch():
   atomic_fetch_sub(&head_->ref_count, 1)
 ```
 
-写者 swap 后，旧 `Segments` 放入退休列表。每 N 次写入或 M 毫秒后，检查退休列表中 ref_count == 0 的版本并释放。
+After a writer swap, the old `Segments` is placed on the retired list. Every N writes or M milliseconds, check retired versions with ref_count == 0 and free them.
 
-### 6.2 写入锁
+### 6.2 Write Lock
 
 ```cpp
 class IndexWriter {
-    std::mutex write_mutex_;  // 仅保护内存段和 WAL
-    // 读路径完全不受此锁影响
+    std::mutex write_mutex_;  // protects only the in-memory segment and WAL
+    // Read path is completely unaffected by this lock
 };
 ```
 
-## 7. Unicode 文本分析
+## 7. Unicode Text Analysis
 
-### 7.1 规范化
+### 7.1 Normalization
 
-搜索质量的基础：全角 → 半角，变音字符标准化，大小写折叠。
+Foundation of search quality: fullwidth → halfwidth, diacritic standardization, case folding.
 
 ```cpp
-// ICU 或内置精简 NFKC 表
-// 编译期宏控制：VORTEX_USE_ICU
+// ICU or built-in compact NFKC table
+// Compile-time macro: VORTEX_USE_ICU
 std::string nfkc_normalize(std::string_view input);
 std::string lowercase(std::string_view input);
 ```
 
-V1 内置 ASCII lowercase + 常用全角/半角映射表（覆盖中文输入法常用的符号、数字、字母）。启用 ICU 后自动升级为完整 NFKC + locale-aware case folding。
+V1 ships with built-in ASCII lowercase + common fullwidth/halfwidth mapping table (covering symbols, digits, and letters commonly used with Chinese IMEs). Enabling ICU auto-upgrades to full NFKC + locale-aware case folding.
 
-### 7.2 流式 Tokenizer
+### 7.2 Streaming Tokenizer
 
-返回 `vector<Token>` 会导致大文本的内存峰值，改为 push-based：
+Returning `vector<Token>` causes memory spikes for large documents. Use a push-based design instead:
 
 ```cpp
 class TokenConsumer {
@@ -357,7 +357,7 @@ public:
     virtual ~Tokenizer() = default;
 };
 
-// 标准拉丁分词
+// Standard Latin tokenization
 class StandardTokenizer : public Tokenizer {
     void tokenize(std::string_view text, TokenConsumer& consumer) override;
 };
@@ -367,11 +367,11 @@ class CJKBigramTokenizer : public Tokenizer {
     void tokenize(std::string_view text, TokenConsumer& consumer) override;
 };
 
-// 混合：按 Unicode 块自动分派
+// Hybrid: auto-dispatch by Unicode block
 class MixedTokenizer : public Tokenizer { ... };
 ```
 
-### 7.3 过滤器链
+### 7.3 Filter Chain
 
 ```cpp
 class TokenFilter {
@@ -385,7 +385,7 @@ class StopwordFilter : public TokenFilter {
     explicit StopwordFilter(
         std::shared_ptr<absl::flat_hash_set<std::string>> stopwords);
 };
-class NFKCFilter : public TokenFilter { ... };  // 增加：规范化 token 文本
+class NFKCFilter : public TokenFilter { ... };  // normalizes token text
 ```
 
 ### 7.4 Analyzer
@@ -396,8 +396,8 @@ public:
     Analyzer(std::unique_ptr<Tokenizer> tokenizer,
              std::vector<std::unique_ptr<TokenFilter>> filters);
 
-    // 获取 term 列表（去位置，只保留去重后的 term + tf）
-    // 结果分配在 ScopedThreadArena 上
+    // Get term list (positions stripped, deduplicated terms + tf only)
+    // Results allocated on ScopedThreadArena
     struct TermWithFreq {
         std::string_view term;
         uint32_t tf;
@@ -410,19 +410,19 @@ private:
 };
 ```
 
-## 8. FST 词典
+## 8. FST Dictionary
 
-### 8.1 设计
+### 8.1 Design
 
 ```
 Term Dictionary (FST):
-  输入: term → 输出: {df: uint32, posting_offset: uint64, posting_len: uint32}
+  Input: term → Output: {df: uint32, posting_offset: uint64, posting_len: uint32}
 
-  特性:
-  - byte-based FST，每个 arc label 一个 byte
-  - 前缀/后缀自动共享（比 hash map 省 10-30x 内存）
-  - 天然字典序，前缀查询 O(k)
-  - 增量最小化构建（参考 Lucene Builder 算法）
+  Characteristics:
+  - Byte-based FST, one byte per arc label
+  - Automatic prefix/suffix sharing (10-30x memory savings vs. hash map)
+  - Natural lexicographic ordering, O(k) prefix queries
+  - Incremental minimal construction (Lucene Builder algorithm)
 ```
 
 ### 8.2 API
@@ -430,18 +430,18 @@ Term Dictionary (FST):
 ```cpp
 class TermDictBuilder {
 public:
-    // 必须按字典序升序插入
+    // Must insert in lexicographic order
     void insert(std::string_view term, uint32_t doc_freq,
                 uint64_t posting_offset, uint32_t posting_len);
-    // 完成构建
+    // Finalize construction
     void finish();
 
-    // 序列化到文件（写入 fst_data + tail xxHash64）
+    // Serialize to file (writes fst_data + tail xxHash64)
     Status write_file(const std::string& path);
 
 private:
-    // 增量最小化 FST 的内部结构
-    // 维护未冻结节点的前缀栈
+    // Internal state for incremental FST minimization
+    // Maintains a prefix stack of unfrozen nodes
 };
 
 class TermDict {
@@ -452,14 +452,14 @@ public:
         uint32_t posting_len;
     };
 
-    // 从 mmap 数据构造（零拷贝，不复制数据）
+    // Construct from mmap data (zero-copy, no data duplication)
     static Result<std::unique_ptr<TermDict>> from_mmap(
         const uint8_t* data, size_t len);
 
-    // 精确查找
+    // Exact lookup
     const TermInfo* lookup(std::string_view term) const;
 
-    // 前缀范围扫描
+    // Prefix range scan
     void prefix_range(std::string_view prefix,
                       std::function<void(std::string_view, const TermInfo&)> fn) const;
 
@@ -469,33 +469,33 @@ private:
 };
 ```
 
-## 9. 倒排链编解码
+## 9. Posting List Codec
 
 ### 9.1 SIMD-BP128
 
-固定块大小 128，契合 SIMD 寄存器宽度（128-bit x 4 = 512 bits）。每条 128 宽 lane 存 128 个 doc delta 的同一 bit position。
+Fixed block size 128, aligned to SIMD register width (128-bit × 4 = 512 bits). Each 128-wide lane stores the same bit-position across 128 doc deltas.
 
 ```
-Block 编码 (128 docs):
+Block encoding (128 docs):
 
 Header (4 bytes):
   [num_docs:8][doc_bits:8][freq_bits:8][flags:8]
 
 Packed Deltas:
-  SIMD-BP128: 128 numbers × doc_bits 位宽
-  假设 doc_bits=13，则需要 (128*13 + 7)/8 = 208 bytes
-  13 个 bit-plane，每个 plane 128 bits 对齐
+  SIMD-BP128: 128 numbers × doc_bits bit-width
+  With doc_bits=13: (128*13 + 7)/8 = 208 bytes
+  13 bit-planes, each 128-bit aligned
 
 Packed Freqs:
-  同样 SIMD-BP128，128 numbers × freq_bits 位宽
+  Same SIMD-BP128, 128 numbers × freq_bits bit-width
 ```
 
-解码时使用 SSE4.2/AVX2 指令一次解 128 个 doc_id，标量 FOR 的 3-5x 吞吐。
+Decoding uses SSE4.2/AVX2 instructions to unpack 128 doc_ids at once, achieving 3-5x throughput vs. scalar FOR.
 
 ```cpp
 namespace vortex::codec {
 
-// 返回写入字节数
+// Returns bytes written
 size_t encode_block_simd(const uint32_t* doc_deltas,
                          const uint32_t* freqs,
                          uint8_t num_docs,
@@ -503,8 +503,8 @@ size_t encode_block_simd(const uint32_t* doc_deltas,
                          uint8_t freq_bits,
                          uint8_t* output);
 
-// 解码一个 block，返回读取字节数
-// 使用 __m128i / __m256i 实现 bit unpack
+// Decodes one block, returns bytes read
+// Uses __m128i / __m256i for bit unpack
 size_t decode_block_simd(const uint8_t* input,
                          uint32_t* doc_ids_out,
                          uint32_t* freqs_out,
@@ -513,38 +513,38 @@ size_t decode_block_simd(const uint8_t* input,
 }  // namespace vortex::codec
 ```
 
-### 9.2 块级多层跳表
+### 9.2 Block-Level Multi-Level Skip List
 
 ```cpp
 struct SkipEntry {
-    uint32_t last_doc_id;      // 块中最大 doc_id
-    uint64_t block_offset;     // 块在 .doc 中的偏移
+    uint32_t last_doc_id;      // max doc_id in the block
+    uint64_t block_offset;     // block offset in .doc
 };
 
 class SkipList {
 public:
-    // 构建多层跳表，skip_interval 为跳步（block 数），默认 4
+    // Build multi-level skip list, skip_interval in blocks, default 4
     void build(const std::vector<uint64_t>& block_offsets,
                const std::vector<uint32_t>& max_doc_per_block,
                int skip_interval = 4);
 
-    // 跳到 >= target 的第一个 block，返回 block 偏移
+    // Skip to first block containing >= target, return block offset
     uint64_t skip_to(uint32_t target_doc, uint64_t current_offset) const;
 
 private:
-    // 多层：level[0] = 每 4 block，level[1] = 每 16 block，level[2] = 每 64 block
+    // Multi-level: level[0] = every 4 blocks, level[1] = every 16 blocks, etc.
     std::vector<std::vector<SkipEntry>> levels_;
 };
 ```
 
-### 9.3 PostingList 构造与读取
+### 9.3 PostingList Construction & Reading
 
 ```cpp
 class PostingListBuilder {
 public:
     void append(uint32_t doc_id, uint32_t term_freq);
-    // 返回 {offset_in_doc_file, byte_count}
-    // 同时写入跳表结构到 footer_with_skip
+    // Returns {offset_in_doc_file, byte_count}
+    // Also writes skip list structure to footer_with_skip
     Result<std::pair<uint64_t, uint32_t>> flush(
         int fd, Arena& scratch);
 
@@ -564,12 +564,12 @@ public:
     PostingListReader(const uint8_t* data, size_t len,
                       const SkipList& skip);
 
-    // 遍历全部 posting + 打分
+    // Iterate all postings + score
     template<typename Fn>
     void for_each(Fn&& fn) const;
 
-    // advance_to: 跳到 >= target 的第一个 posting
-    // 利用 skip list 跳过整块，当前块内线性扫描
+    // advance_to: skip to first posting >= target
+    // Uses skip list to jump over whole blocks, linear scan within block
     bool advance_to(uint32_t target, uint32_t& doc_id, uint32_t& tf) const;
 
     size_t doc_freq() const;
@@ -582,23 +582,23 @@ private:
 };
 ```
 
-### 9.4 稀疏倒排链优化
+### 9.4 Sparse Posting List Optimization
 
-高频 term（出现于 > 10% 文档）的 posting list 可能百万级：
+High-frequency terms (appearing in > 10% of docs) can have posting lists in the millions:
 
-- 此类 term 的 IDF 极低，对最终分数贡献小
-- 在 AND 求交中作为"长链"被排在最后
-- 标记为 `SPARSE_OPT` flag，score 计算时使用近似 IDF（使用全局统计而非精确 doc_freq）
-- 支持 `advance_to` 提前终止：如果当前文档的 BM25 贡献低于阈值，跳过
+- IDF for such terms is extremely low; contribution to final score is minimal
+- In AND intersection, these "long lists" are processed last
+- Marked with `SPARSE_OPT` flag; score computation uses approximate IDF (global stats instead of exact doc_freq)
+- `advance_to` supports early termination: if current doc's BM25 contribution is below threshold, skip
 
-## 10. AND/OR 交集算法
+## 10. AND/OR Intersection Algorithms
 
-### 10.1 AND 求交
+### 10.1 AND Conjunction
 
 ```
 intersect(readers, topk):
-  1. 按 doc_freq 升序排列 readers
-  2. 以最短 reader 为驱动
+  1. Sort readers by doc_freq ascending
+  2. Drive with shortest reader
   3. for each posting in readers[0]:
        doc = posting.doc_id
        ok = true
@@ -607,11 +607,11 @@ intersect(readers, topk):
        if ok:
          score = bm25f(doc, all_hit_tfs, field_lengths)
          push heap(score, doc)
-  4. 可选提前终止：
-     如果 heap 中 topk 的最小分数 > 当前 reader 剩余所有 posting 的最大可能贡献 → 退出
+  4. Optional early termination:
+     If min score in heap topk > max possible contribution of remaining postings → exit
 ```
 
-### 10.2 OR 求并
+### 10.2 OR Disjunction
 
 ```
 union_merge(readers, topk):
@@ -624,17 +624,17 @@ union_merge(readers, topk):
     advance each emptied reader, push back if not exhausted
 ```
 
-## 11. BM25F 打分
+## 11. BM25F Scoring
 
-### 11.1 字段加权 BM25
+### 11.1 Field-Weighted BM25
 
-单一 BM25 将 title 和 body 同等对待，不合理。BM25F 按字段独立参数线性组合：
+Plain BM25 treats title and body equally, which is unreasonable. BM25F uses per-field parameter linear combination:
 
 ```cpp
 struct FieldBM25Params {
     double k1 = 1.2;
     double b = 0.75;
-    double weight = 1.0;  // 字段权重
+    double weight = 1.0;  // field weight
 };
 
 struct BM25Params {
@@ -647,11 +647,11 @@ public:
                uint64_t total_docs,
                const std::vector<double>& field_avg_lengths);
 
-    // 单 term 在单 field 上的分数
+    // Single term, single field score contribution
     double score(uint32_t tf, uint32_t doc_freq,
                  uint32_t field_length, uint8_t field_index) const;
 
-    // 文档最终分数 = Σ over terms Σ over fields
+    // Final doc score = Σ over terms Σ over fields
     //   field_weight[f] * IDF(term) * tf_norm(tf, field_len, k1_f, b_f)
     double combine(std::vector<double> per_field_term_scores) const;
 
@@ -664,41 +664,41 @@ private:
 };
 ```
 
-### 11.2 插件化 Scorer
+### 11.2 Pluggable Scorer
 
 ```cpp
 class Scorer {
 public:
     virtual ~Scorer() = default;
 
-    // 初始化（绑定段统计信息）
+    // Initialize (bind to segment statistics)
     virtual Status init(uint64_t total_docs,
                         const std::vector<double>& field_avg_lengths) = 0;
 
-    // 单 term-field 贡献
+    // Single term-field contribution
     virtual double term_score(uint32_t tf, uint32_t doc_freq,
                               uint32_t field_length,
                               uint8_t field_index) const = 0;
 
-    // 组合
+    // Combination
     virtual double combine(
         absl::Span<const double> term_scores) const = 0;
 
-    // 场权重
+    // Field weight
     virtual double field_weight(uint8_t field_index) const = 0;
 };
 
-// 默认实现
+// Default implementation
 class BM25FScorer : public Scorer { ... };
 
-// V2 可扩展 LTR、LambdaMART
+// V2 extensibility: LTR, LambdaMART
 ```
 
-## 12. WAL（Write-Ahead Log）
+## 12. WAL (Write-Ahead Log)
 
-### 12.1 二进制格式
+### 12.1 Binary Format
 
-JSON 行格式在吞吐量上不可接受。改为二进制：
+JSON line format is unacceptable for throughput. Use a binary format instead:
 
 ```
 WAL Record:
@@ -717,17 +717,17 @@ class WAL {
 public:
     WAL(const std::string& path);
 
-    // 追加（线程安全），写入内存 buffer，不立刻 fsync
+    // Append (thread-safe), writes to in-memory buffer, no immediate fsync
     void append_add(uint64_t internal_id, const Document& doc);
     void append_remove(uint64_t internal_id);
 
-    // 强制刷盘（定期或阈值触发）
+    // Force flush to disk (periodic or threshold-triggered)
     Status sync();
 
-    // flush 后截断
+    // Truncate after flush
     Status truncate();
 
-    // 崩溃恢复
+    // Crash recovery
     struct RecoveryState {
         uint64_t next_internal_id;
         std::vector<std::pair<uint64_t, Document>> active_docs;
@@ -739,19 +739,19 @@ private:
     int fd_;
     std::mutex mutex_;
     std::vector<uint8_t> write_buf_;  // group commit buffer
-    uint32_t max_buf_size_ = 64 * 1024;  // 64KB 积攒阈值
+    uint32_t max_buf_size_ = 64 * 1024;  // 64KB accumulation threshold
 };
 ```
 
-Group commit 策略：
-- 写入 buffer，buffer 满 64KB 或距上次 sync 超过 10ms → fsync
-- 崩溃恢复时重放全部记录（WAL 只在两次 flush 之间存在，数据量 < 1GB）
+Group commit policy:
+- Write to buffer; when buffer reaches 64KB or 10ms since last sync → fsync
+- Crash recovery replays all records (WAL only exists between two flushes, data size < 1GB)
 
-## 13. 数据完整性
+## 13. Data Integrity
 
-### 13.1 文件尾校验
+### 13.1 File Tail Checksums
 
-所有数据文件（.fst, .doc, .store, .fwd）末尾 8 字节：
+All data files (.fst, .doc, .store, .fwd) have an 8-byte tail:
 
 ```
 ┌──────────────────┬──────────────────┐
@@ -759,9 +759,9 @@ Group commit 策略：
 └──────────────────┴──────────────────┘
 ```
 
-### 13.2 Segment Manifest 校验
+### 13.2 Segment Manifest Checksums
 
-segments.manifest 包含每个段的文件列表 + 预期 checksum：
+segments.manifest contains a file list + expected checksums per segment:
 
 ```json
 {
@@ -783,20 +783,20 @@ segments.manifest 包含每个段的文件列表 + 预期 checksum：
 }
 ```
 
-加载段时逐文件校验，任何不匹配都拒绝加载并报告 CORRUPT_INDEX。
+Every file is validated on segment load. Any mismatch rejects the segment and reports CORRUPT_INDEX.
 
-## 14. 文件组织
+## 14. File Organization
 
 ```
 index_dir/
-├── wal.log              ← 二进制 WAL
-├── segments.manifest    ← 段清单 + checksums (JSON)
+├── wal.log              ← binary WAL
+├── segments.manifest    ← segment manifest + checksums (JSON)
 ├── _0.fst / _0.doc / _0.store / _0.fwd / _0.meta / _0.del
 ├── _1.fst / _1.doc / _1.store / _1.fwd / _1.meta / _1.del
 └── ...
 ```
 
-### 14.1 段元信息
+### 14.1 Segment Metadata
 
 ```json
 {
@@ -815,25 +815,25 @@ index_dir/
 }
 ```
 
-## 15. 可观测性
+## 15. Observability
 
-第一天就内建埋点：
+Instrumentation is built-in from day one:
 
 ```cpp
 struct IndexStats {
-    // 索引统计
+    // Index statistics
     uint64_t total_docs;
     uint64_t total_terms;
     uint64_t segment_count;
-    uint64_t memory_bytes;     // 内存段当前占用
-    uint64_t disk_bytes;       // 磁盘文件总大小
+    uint64_t memory_bytes;     // current in-memory segment usage
+    uint64_t disk_bytes;       // total on-disk file size
     double avgdl;
 
     // WAL
     uint64_t wal_bytes;
     uint32_t wal_sync_count;
 
-    // 写入
+    // Writes
     uint64_t docs_added_total;
     uint64_t docs_removed_total;
     uint64_t flush_count;
@@ -842,7 +842,7 @@ struct IndexStats {
 };
 
 struct QueryStats {
-    // 查询
+    // Queries
     uint64_t queries_total;
     Histogram query_latency_ms;     // P50/P90/P99
     Histogram segments_per_query;
@@ -855,9 +855,9 @@ const IndexStats& writer->stats() const;
 const QueryStats& reader->stats() const;
 ```
 
-Histogram 使用固定 bucket 的整数计数数组，不分配内存。
+Histogram uses a fixed-bucket integer count array with no dynamic allocation.
 
-## 16. Query 模型
+## 16. Query Model
 
 ```cpp
 enum class QueryType : uint8_t { TERM, AND, OR, NOT };
@@ -867,7 +867,7 @@ struct Query {
     std::string term;               // TERM
     std::vector<Query> sub_queries; // AND/OR/NOT
 
-    // 工厂方法
+    // Factory methods
     static Query Term(std::string t);
     static Query And(std::vector<Query> sub);
     static Query Or(std::vector<Query> sub);
@@ -877,43 +877,43 @@ struct Query {
 struct ScoredDoc {
     uint32_t internal_doc_id;
     float score;
-    uint64_t segment_id;  // 定位段
+    uint64_t segment_id;  // locates the segment
 };
 
 struct SearchResult {
     std::vector<ScoredDoc> docs;
-    uint64_t total_hits;  // 近似值（等于 matched docs 数）
+    uint64_t total_hits;  // approximate (equals matched doc count)
     uint64_t elapsed_us;
 };
 ```
 
-## 17. API 入口
+## 17. API Entry Points
 
 ```cpp
 namespace vortex {
 
-// 创建或打开索引
+// Create or open index
 Result<std::shared_ptr<IndexWriter>> open_index(
     const std::string& index_dir,
     const Schema& schema);
 
-// 写入
+// Write
 writer->add_document(doc);           // → Status
 writer->remove_document(doc_id);     // → Status
 writer->flush();                     // → Status
 
-// 读取（获取当前快照 reader）
+// Read (acquire point-in-time snapshot reader)
 auto reader = writer->get_reader();  // → shared_ptr<IndexReader>
 auto result = reader->search(query, topk);  // → Result<SearchResult>
 
-// 统计
+// Statistics
 writer->stats();   // → IndexStats
 reader->stats();   // → QueryStats
 
 }  // namespace vortex
 ```
 
-## 18. 代码目录
+## 18. Directory Layout
 
 ```
 include/vortex/core/
@@ -925,7 +925,7 @@ include/vortex/core/
 ├── search_result.h      // ScoredDoc, SearchResult
 ├── stats.h              // IndexStats, QueryStats, Histogram
 ├── checksum.h           // xxHash64 wrapper
-└── types.h              // 基础类型别名
+└── types.h              // fundamental type aliases
 
 include/vortex/inverted/
 ├── index_writer.h       // IndexWriter
@@ -949,8 +949,8 @@ src/inverted/
 ├── segment.cpp
 ├── segment_list.cpp
 ├── term_dict.cpp
-├── term_dict_builder.cpp   // FST 增量最小化构建
-├── posting_codec.cpp       // SIMD-BP128 (SSE4.2 + AVX2 分发)
+├── term_dict_builder.cpp   // FST incremental minimal construction
+├── posting_codec.cpp       // SIMD-BP128 (SSE4.2 + AVX2 dispatch)
 ├── posting_list.cpp
 ├── skip_list.cpp
 ├── scorer.cpp
@@ -961,55 +961,55 @@ src/inverted/
 └── unicode.cpp
 ```
 
-## 19. 构建 & CI 要求
+## 19. Build & CI Requirements
 
-### 19.1 编译器
+### 19.1 Compilers
 
 ```
-最低: GCC 11+, Clang 18+
-推荐: GCC 14+, Clang 20+
-SIMD: 编译期检测，SSE4.2 最低，AVX2 可选加速
+Minimum: GCC 11+, Clang 18+
+Recommended: GCC 14+, Clang 20+
+SIMD: compile-time detection, SSE4.2 minimum, AVX2 optional acceleration
 ```
 
-### 19.2 CMake 补充
+### 19.2 CMake Additions
 
 ```cmake
-# 严格警告
+# Strict warnings
 target_compile_options(vortex PRIVATE
     -Wall -Wextra -Wpedantic -Werror
-    -Wno-unused-parameter    # 接口预留参数
+    -Wno-unused-parameter    # reserved interface parameters
 )
 
-# Sanitizer 构建类型
+# Sanitizer build types
 option(VORTEX_ASAN ON)
 option(VORTEX_UBSAN ON)
 
-# SIMD 选项
+# SIMD options
 option(VORTEX_USE_AVX2 ON)
-option(VORTEX_USE_ICU OFF)  # 可选 ICU 依赖
+option(VORTEX_USE_ICU OFF)  # optional ICU dependency
 
 # clang-tidy
 set(CMAKE_CXX_CLANG_TIDY clang-tidy)
 ```
 
-### 19.3 CI 流水线
+### 19.3 CI Pipeline
 
 ```
 Matrix: {gcc-13, gcc-14, clang-18, clang-20} × {Debug, Release, ASan+UBSan}
 
-每个 job:
+Per job:
   cmake -B build -DCMAKE_BUILD_TYPE=$TYPE -DVORTEX_BUILD_TESTS=ON
   cmake --build build -j$(nproc)
   cd build && ctest --output-on-failure
 
-Release 额外:
+Release extra:
   cd build && ./benchmarks/vortex_index_benchmarks
 
-clang-tidy 检查（单独 job）
-clang-format 检查 --dry-run（单独 job）
+clang-tidy check (separate job)
+clang-format --dry-run check (separate job)
 ```
 
-### 19.4 覆盖率
+### 19.4 Coverage
 
 ```cmake
 # Coverage build
@@ -1020,35 +1020,35 @@ if(VORTEX_COVERAGE)
 endif()
 ```
 
-目标：行覆盖率 > 85%。
+Target: line coverage > 85%.
 
-## 20. 实现顺序
+## 20. Implementation Order
 
-| 阶段 | 内容 | 产出文件 | 预估工时 |
-|------|------|---------|---------|
-| 0 | 基础设施：Status, Arena, Checksum, Stats | core/ 全 6 个头文件 | 基准 |
-| 1 | Unicode 规范化 + Analyzer + Tokenizer | analyzer/, unicode/ | 3d |
+| Phase | Content | Output | Est. Effort |
+|-------|---------|--------|-------------|
+| 0 | Infrastructure: Status, Arena, Checksum, Stats | All 6 headers in core/ | Baseline |
+| 1 | Unicode normalization + Analyzer + Tokenizer | analyzer/, unicode/ | 3d |
 | 2 | PostingList Codec (SIMD-BP128) + SkipList | posting_codec, skip_list | 3d |
-| 3 | FST 词典构建 + 查询 | term_dict, term_dict_builder | 5d |
-| 4 | Segment (内存 + 磁盘) + 序列化 | segment | 3d |
+| 3 | FST dictionary construction + queries | term_dict, term_dict_builder | 5d |
+| 4 | Segment (in-memory + on-disk) + serialization | segment | 3d |
 | 5 | BM25F Scorer | scorer | 2d |
-| 6 | WAL (二进制 + group commit) | wal | 2d |
+| 6 | WAL (binary + group commit) | wal | 2d |
 | 7 | SegmentList (RCU) | segment_list | 2d |
-| 8 | IndexWriter + IndexReader 串联 | index_writer, index_reader | 3d |
-| 9 | 单元测试全覆盖 | tests/ (per module) | 每阶段并行 |
-| 10 | Benchmark + 性能调优 | benchmarks/ | 3d |
-| 11 | CI/CD 配置 | .github/workflows/ | 1d |
+| 8 | IndexWriter + IndexReader integration | index_writer, index_reader | 3d |
+| 9 | Full unit test coverage | tests/ (per module) | Ongoing |
+| 10 | Benchmark + perf tuning | benchmarks/ | 3d |
+| 11 | CI/CD configuration | .github/workflows/ | 1d |
 
-阶段 1-4 依赖链：1 → 2/3 可并行 → 4 依赖 2+3
-阶段 5-8：5+6 并行 → 7 → 8
-阶段 9：全程并行，每完成一个模块就写测试
+Dependency chain for phases 1-4: 1 → 2/3 (parallelizable) → 4 (depends on 2+3)
+Phases 5-8: 5+6 in parallel → 7 → 8
+Phase 9: continuous, write tests as each module completes
 
-## 21. 设计原则总结
+## 21. Design Principles Summary
 
-1. **数据结构决定性能天花板** — FST, SIMD-BP128, SkipList 每个选择都是经过基准工业验证的
-2. **分配器可控** — 不使用裸 new/malloc，Arena 分层隔离
-3. **零拷贝读取** — mmap + FST 直接映射，查询路径不复制 posting data
-4. **数据安全** — 每个文件带 checksum，加载时校验
-5. **可观测** — 统计埋点第一天就做，不是事后追加
-6. **API 不抛异常** — Status/Result\<T\>，干净的错误处理
-7. **编译期分派** — SIMD 根据 CPU 能力选择最优路径，不运行时判断
+1. **Data structures set the performance ceiling** — FST, SIMD-BP128, SkipList: every choice is benchmark-validated and industry-proven
+2. **Controlled allocation** — no bare new/malloc; layered Arena isolation
+3. **Zero-copy reads** — mmap + FST direct mapping; query path never copies posting data
+4. **Data safety** — every file carries a checksum; validated on load
+5. **Observable** — stats instrumentation from day one, not an afterthought
+6. **No-throw API** — Status/Result\<T\>, clean error handling
+7. **Compile-time dispatch** — SIMD path selected by CPU capability, no runtime branching
