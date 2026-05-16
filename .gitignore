@@ -1,0 +1,17 @@
+# Build
+build/
+cmake-build-*/
+out/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Research docs (local only)
+research/
+
+# Dependencies
+third_party/
