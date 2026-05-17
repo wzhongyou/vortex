@@ -1,37 +1,37 @@
 # Contributing to Vortex
 
-感谢你对 Vortex 的关注！项目目前处于**规划阶段**，欢迎参与早期讨论和设计。
+Thanks for your interest! Vortex is currently in the **planning phase** — early design discussions and contributions are welcome.
 
-## 参与方式
+## How to Contribute
 
-- **设计讨论** — 通过 GitHub Issues 参与架构设计和 API 讨论
-- **代码贡献** — Fork 仓库，在 feature 分支开发，提交 PR 到 `main`
-- **文档** — 改进或翻译文档同样欢迎
+- **Design discussions** — participate in architecture and API design via GitHub Issues
+- **Code** — fork the repo, develop on a feature branch, submit PRs to `main`
+- **Documentation** — improvements and translations are also appreciated
 
-## 开发环境
+## Development Environment
 
-- C++17 编译器（GCC 9+ / Clang 10+ / Apple Clang 14+）
+- C++17 compiler (GCC 9+ / Clang 10+ / Apple Clang 14+)
 - CMake 3.16+
-- GoogleTest（测试）/ Google Benchmark（性能测试）
-- FlatBuffers（序列化）
+- GoogleTest (testing) / Google Benchmark (benchmarks)
+- FlatBuffers (serialization)
 
 ```bash
-# 配置并构建
+# Configure and build
 cmake -B build -DCMAKE_BUILD_TYPE=Debug -DVORTEX_BUILD_TESTS=ON
 cmake --build build -j$(nproc)
 
-# 运行测试
+# Run tests
 cd build && ctest --output-on-failure
 ```
 
-## 代码风格
+## Code Style
 
-- C++17 标准
-- `#pragma once` 头文件保护
-- 命名空间 `vortex::`
-- 模板代码优先 header-only；非模板逻辑使用 `.cpp`
-- 提交信息使用英文
+- C++17 standard
+- `#pragma once` header guards
+- `vortex::` namespace
+- Header-only for template-heavy code; `.cpp` for non-template logic
+- Commit messages in English
 
 ## License
 
-MIT — 所有贡献均在此协议下授权。
+MIT — all contributions are licensed under this agreement.

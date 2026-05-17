@@ -29,31 +29,7 @@ cd build && ctest -R <test_name> --output-on-failure
 cd build && ./benchmarks/vortex_benchmarks
 ```
 
-## Architecture
-
-Four-layer design:
-
-```
-┌──────────────────────────────────────┐
-│  RecallEngine (orchestration+fusion) │
-├──────────────────────────────────────┤
-│  InvertedIndex  │  VectorIndex | ... │  ← Index implementations
-├──────────────────────────────────────┤
-│         Index (abstract interface)   │
-├──────────────────────────────────────┤
-│  Analyzer │ DocStore │ Serializer   │  ← Shared infra
-└──────────────────────────────────────┘
-```
-
-### Key abstractions
-
-- **`Index`** (`include/vortex/core/index.h`) — virtual base: `build()`, `search(query) → Results`, `insert(doc)`, `remove(id)`, `serialize()/deserialize()`
-- **`InvertedIndex`** — tokenizes text fields, builds posting lists, scores via BM25/TF-IDF
-- **`VectorIndex`** — stores embeddings, builds HNSW graph, supports L2/IP/Cosine distance
-- **`RecallEngine`** — holds multiple `Index` instances, fans out queries concurrently, merges ranked lists (RRF or weighted fusion)
-- **`DocStore`** — raw document storage with forward-field access
-
-### Directory layout
+## Directory layout
 
 ```
 include/vortex/core/     # Index, Document, Result, Field
@@ -74,3 +50,7 @@ benchmarks/              # Google Benchmark micro-benchmarks
 - FlatBuffers for on-disk serialization
 - Namespace: `vortex::`
 - Include guard style: `#pragma once`
+
+## Architecture
+
+See [README.md](README.md) for the four-layer architecture overview and design principles.
