@@ -8,8 +8,12 @@ namespace vortex::codec {
 DecodeFunc g_decode_block = decode_block;
 
 void codec_init() {
-    // On x86-64 with AVX2, switch to AVX2 implementation.
-    // On ARM64, scalar path is the default (NEON path is future work).
+#ifdef VORTEX_HAS_AVX2
+    if (__builtin_cpu_supports("avx2")) {
+        g_decode_block = decode_block_avx2;
+        return;
+    }
+#endif
     g_decode_block = decode_block;
 }
 

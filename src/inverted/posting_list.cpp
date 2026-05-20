@@ -49,6 +49,9 @@ Result<std::pair<uint64_t, uint32_t>> PostingListBuilder::flush(
         pos += n;
     }
 
+    // Sentinel: zero header marks end of blocks for reader
+    all_data.insert(all_data.end(), 4, 0);
+
     // Build skip list
     SkipList sl;
     sl.build(block_offsets, block_max_doc, 4);
@@ -94,6 +97,8 @@ PostingListReader::PostingListReader(const uint8_t* data, size_t len)
     }
 
     if (p < end) {
+        // Skip past the 4-byte zero sentinel
+        if (p + 4 <= end) p += 4;
         size_t skip_len = end - p;
         skip_list_ = SkipList::deserialize(p, skip_len);
     }

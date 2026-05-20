@@ -1,8 +1,10 @@
 #include "vortex/inverted/external_id_map.h"
 
 #include <unistd.h>
+#include <fcntl.h>
 #include <algorithm>
 #include <cstring>
+#include <vector>
 
 #include "vortex/core/arena.h"
 
@@ -48,11 +50,48 @@ Status ExternalIdMap::flush(int fd, Arena& scratch) {
 
 Result<std::unique_ptr<ExternalIdMap>> ExternalIdMap::from_file(
     const std::string& path) {
-    // Not implemented in V1 header-only mode.
-    // Will be implemented when we add file I/O in Segment.
-    (void)path;
-    return Result<std::unique_ptr<ExternalIdMap>>::Err(
-        Status::Internal("not implemented"));
+    int fd = open(path.c_str(), O_RDONLY);
+    if (fd < 0) {
+        return Result<std::unique_ptr<ExternalIdMap>>::Err(
+            Status::IOError("cannot open " + path));
+    }
+
+    off_t file_size = lseek(fd, 0, SEEK_END);
+    if (file_size <= 0) {
+        close(fd);
+        return Result<std::unique_ptr<ExternalIdMap>>::Ok(
+            std::make_unique<ExternalIdMap>());
+    }
+    lseek(fd, 0, SEEK_SET);
+
+    std::vector<uint8_t> buf(static_cast<size_t>(file_size));
+    ssize_t n = read(fd, buf.data(), buf.size());
+    close(fd);
+    if (n <= 0) {
+        return Result<std::unique_ptr<ExternalIdMap>>::Ok(
+            std::make_unique<ExternalIdMap>());
+    }
+
+    auto map = std::make_unique<ExternalIdMap>();
+    size_t off = 0;
+    if (off + 4 > buf.size()) return Result<std::unique_ptr<ExternalIdMap>>::Ok(std::move(map));
+
+    uint32_t count;
+    std::memcpy(&count, &buf[off], 4);
+    off += 4;
+
+    for (uint32_t i = 0; i < count; i++) {
+        if (off + 2 > buf.size()) break;
+        uint16_t len;
+        std::memcpy(&len, &buf[off], 2);
+        off += 2;
+        if (off + len > buf.size()) break;
+        std::string ext_id(reinterpret_cast<const char*>(&buf[off]), len);
+        off += len;
+        map->map_[ext_id] = {0, i};  // segment_id=0, internal_doc_id=i
+    }
+
+    return Result<std::unique_ptr<ExternalIdMap>>::Ok(std::move(map));
 }
 
 std::string ExternalIdMap::resolve(uint32_t doc_id) const {

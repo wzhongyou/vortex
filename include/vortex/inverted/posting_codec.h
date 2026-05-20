@@ -20,6 +20,11 @@ size_t encode_block(const uint32_t* doc_ids, const uint32_t* freqs,
 size_t decode_block(const uint8_t* input, uint32_t* doc_ids_out,
                     uint32_t* freqs_out, uint8_t& num_docs_out);
 
+#ifdef VORTEX_HAS_AVX2
+size_t decode_block_avx2(const uint8_t* input, uint32_t* doc_ids_out,
+                          uint32_t* freqs_out, uint8_t& num_docs_out);
+#endif
+
 using DecodeFunc = size_t (*)(const uint8_t*, uint32_t*, uint32_t*, uint8_t&);
 extern DecodeFunc g_decode_block;
 

@@ -17,10 +17,12 @@ void SkipList::build(const std::vector<uint64_t>& block_offsets,
     int step = skip_interval;
     while (step < static_cast<int>(num_blocks)) {
         std::vector<SkipEntry> level;
-        for (size_t i = step - 1; i < num_blocks; i += step) {
-            SkipEntry entry;
-            entry.last_doc_id = block_max_doc[i];
-            entry.block_offset = block_offsets[i];
+        for (size_t i = step; i <= num_blocks; i += step) {
+            size_t group_start = i - step;
+            size_t group_end = std::min(static_cast<size_t>(i), num_blocks) - 1;
+            // last_doc_id is the max doc_id in this group
+            uint32_t max_doc = block_max_doc[group_end];
+            SkipEntry entry{max_doc, block_offsets[group_start]};
             level.push_back(entry);
         }
         levels_.push_back(std::move(level));
@@ -31,18 +33,13 @@ void SkipList::build(const std::vector<uint64_t>& block_offsets,
 uint64_t SkipList::advance(uint32_t target, uint64_t current_offset) const {
     if (levels_.empty()) return 0;
 
-    // Start from the highest level and find the right block range.
-    // Returns the offset of the block just before the first one with
-    // last_doc_id >= target. The caller should decode from that block.
-
-    // Walk down from top level to find the target block offset.
-    for (int level_idx = static_cast<int>(levels_.size()) - 1;
-         level_idx >= 0; level_idx--) {
-        const auto& level = levels_[level_idx];
-        for (const auto& entry : level) {
-            if (entry.last_doc_id >= target) {
-                return entry.block_offset;
-            }
+    // Scan level 0 linearly to find the first entry with last_doc_id >= target.
+    // The multi-level skip optimization is deferred — level 0 scan is correct
+    // and sufficient for V1 block counts (typically < 100 blocks per segment).
+    const auto& level0 = levels_[0];
+    for (const auto& entry : level0) {
+        if (entry.last_doc_id >= target) {
+            return entry.block_offset;
         }
     }
 
