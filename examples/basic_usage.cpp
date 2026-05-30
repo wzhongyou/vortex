@@ -75,6 +75,19 @@ int main(int argc, char** argv) {
            ws.docs_added.get(), ws.flushes.get(), ws.segment_count.get(),
            ws.memory_bytes.get(), ws.disk_bytes.get());
 
+    // ── Step 4: 取回原文 ──
+    printf("\n── Step 4: get_document (取回原文) ──\n");
+    auto r = reader->search(Query::And({Query::Term("neural"), Query::Term("networks")}), 10).move_value();
+    for (auto& d : r.docs) {
+        auto doc_opt = reader->get_document(d.external_id).move_value();
+        if (doc_opt.has_value()) {
+            auto& doc = doc_opt.value();
+            printf("  [%s] score=%.2f\n", d.external_id.c_str(), d.score);
+            for (auto& fv : doc.fields)
+                printf("    %s: %s\n", fv.name.c_str(), fv.value.c_str());
+        }
+    }
+
     std::filesystem::remove_all(dir);
     printf("\n✓ Done (临时索引已清理)\n");
     return 0;

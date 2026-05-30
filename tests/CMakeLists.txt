@@ -5,6 +5,11 @@ add_executable(test_integration test_integration.cpp)
 target_link_libraries(test_integration PRIVATE vortex gtest gtest_main)
 gtest_discover_tests(test_integration)
 
+# ── Merge test ──
+add_executable(test_merge test_merge.cpp)
+target_link_libraries(test_merge PRIVATE vortex gtest gtest_main)
+gtest_discover_tests(test_merge)
+
 # ── Unit tests ──
 set(UNIT_TESTS
     test_arena

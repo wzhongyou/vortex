@@ -1,8 +1,11 @@
 #include "vortex/inverted/index_reader.h"
 
 #include <algorithm>
+#include <optional>
 #include <queue>
 #include <unordered_map>
+#include "vortex/core/document.h"
+#include "vortex/core/schema.h"
 #include "vortex/inverted/forward_index.h"
 #include "vortex/inverted/delete_bitmap.h"
 #include "vortex/inverted/term_dict.h"
@@ -15,9 +18,11 @@
 namespace vortex {
 
 IndexReader::IndexReader(SegmentsSnapshot* snapshot,
-                         SegmentList* segment_list)
+                         SegmentList* segment_list,
+                         const Schema* schema)
     : snapshot_(snapshot)
-    , segment_list_(segment_list) {
+    , segment_list_(segment_list)
+    , schema_(schema) {
     BM25Params params;
     scorer_ = std::make_unique<BM25FScorer>(
         params, snapshot->total_docs, snapshot->avgdl);
@@ -260,6 +265,39 @@ Result<SearchResult> IndexReader::search(const Query& query, size_t topk) {
 
     result.elapsed_us = 0;
     return Result<SearchResult>::Ok(std::move(result));
+}
+
+Result<std::optional<Document>> IndexReader::get_document(
+    std::string_view external_id) {
+    if (!snapshot_ || !schema_) {
+        return Result<std::optional<Document>>::Ok(std::nullopt);
+    }
+
+    // Find which segment holds this external_id
+    for (auto& seg : snapshot_->segments) {
+        uint32_t doc_id = seg->find_doc_id(external_id);
+        if (doc_id == kInvalidDocId) continue;
+
+        // Read stored field values from the segment
+        std::vector<std::string> values;
+        seg->get_stored_values(doc_id, values, schema_->stored_field_count());
+
+        // Reconstruct Document using schema stored field names
+        Document doc;
+        uint16_t si = 0;
+        for (auto& fs : schema_->fields) {
+            if (fs.stored) {
+                doc.fields.push_back({
+                    fs.name,
+                    si < values.size() ? values[si] : std::string()
+                });
+                si++;
+            }
+        }
+        return Result<std::optional<Document>>::Ok(std::move(doc));
+    }
+
+    return Result<std::optional<Document>>::Ok(std::nullopt);
 }
 
 }  // namespace vortex

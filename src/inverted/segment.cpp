@@ -17,6 +17,8 @@
 
 namespace vortex {
 
+static const std::string empty_string;
+
 Segment::Segment(uint64_t id, uint32_t doc_count, double avgdl)
     : id_(id), doc_count_(doc_count), avgdl_(avgdl) {}
 
@@ -52,6 +54,21 @@ Status Segment::load_deletes(const uint8_t* data, size_t len) {
 
 Status Segment::load_idm(const uint8_t* data, size_t len) {
     owned_idm_data_.assign(data, data + len);
+
+    // Build reverse mapping external_id → doc_id
+    ext_id_to_doc_.clear();
+    if (len < 4) return Status::OK();
+    const uint8_t* p = owned_idm_data_.data();
+    uint32_t count;
+    std::memcpy(&count, p, 4); p += 4;
+    for (uint32_t i = 0; i < count; i++) {
+        if (p + 2 > owned_idm_data_.data() + len) break;
+        uint16_t slen;
+        std::memcpy(&slen, p, 2); p += 2;
+        if (p + slen > owned_idm_data_.data() + len) break;
+        ext_id_to_doc_[std::string(reinterpret_cast<const char*>(p), slen)] = i;
+        p += slen;
+    }
     return Status::OK();
 }
 
@@ -82,6 +99,53 @@ const TermInfo* Segment::lookup_term(std::string_view term) const {
     return term_dict_->lookup(term);
 }
 
+Status Segment::load_store(const uint8_t* data, size_t len) {
+    // .store format: [doc_count:u32][stored_field_count:u16]
+    //                then per-doc: [value_len:u32][value:char[value_len]] × stored_field_count
+    // Data is kept as a blob; get_stored_values() parses it on the fly.
+    if (len < 6) return Status::OK();  // empty store
+    owned_store_data_.assign(data, data + len);
+    return Status::OK();
+}
+
+uint32_t Segment::find_doc_id(std::string_view external_id) const {
+    auto it = ext_id_to_doc_.find(std::string(external_id));
+    return it != ext_id_to_doc_.end() ? it->second : kInvalidDocId;
+}
+
+void Segment::get_stored_values(uint32_t doc_id,
+                                 std::vector<std::string>& out_values,
+                                 uint16_t stored_field_count) const {
+    out_values.clear();
+    if (owned_store_data_.size() < 6) return;
+
+    const uint8_t* p = owned_store_data_.data();
+    uint32_t doc_count;
+    std::memcpy(&doc_count, p, 4); p += 4;
+    uint16_t sf_count;
+    std::memcpy(&sf_count, p, 2); p += 2;
+    if (sf_count == 0) return;
+    if (doc_id >= doc_count) return;
+
+    // Skip to the right doc
+    for (uint32_t i = 0; i < doc_id; i++) {
+        for (uint16_t f = 0; f < sf_count; f++) {
+            uint32_t vlen;
+            std::memcpy(&vlen, p, 4); p += 4;
+            p += vlen;
+        }
+    }
+
+    out_values.reserve(stored_field_count);
+    uint16_t n = sf_count < stored_field_count ? sf_count : stored_field_count;
+    for (uint16_t f = 0; f < n; f++) {
+        uint32_t vlen;
+        std::memcpy(&vlen, p, 4); p += 4;
+        out_values.emplace_back(reinterpret_cast<const char*>(p), vlen);
+        p += vlen;
+    }
+}
+
 // ── MemorySegment ──
 
 MemorySegment::MemorySegment(uint64_t seg_id, uint16_t indexed_field_count)
@@ -110,6 +174,10 @@ void MemorySegment::add_doc_info(uint32_t doc_length,
 
 void MemorySegment::add_external_id(std::string_view external_id) {
     external_ids_.emplace_back(external_id);
+}
+
+void MemorySegment::add_stored_values(std::vector<std::string> values) {
+    stored_values_.push_back(std::move(values));
 }
 
 Result<std::shared_ptr<const Segment>> MemorySegment::flush(
@@ -232,6 +300,29 @@ Result<std::shared_ptr<const Segment>> MemorySegment::flush(
         close(fd);
     }
 
+    // .store
+    {
+        int fd = open((seg_prefix + ".store").c_str(), O_CREAT | O_RDWR | O_TRUNC, 0644);
+        if (fd < 0) return Result<std::shared_ptr<const Segment>>::Err(
+            Status::IOError("cannot create .store"));
+
+        uint16_t sf_count = stored_values_.empty() ? 0
+            : static_cast<uint16_t>(stored_values_[0].size());
+        uint32_t dc = doc_count_;
+        write(fd, &dc, 4);
+        write(fd, &sf_count, 2);
+        for (uint32_t i = 0; i < doc_count_; i++) {
+            for (uint16_t f = 0; f < sf_count; f++) {
+                const std::string& v = (i < stored_values_.size() && f < stored_values_[i].size())
+                    ? stored_values_[i][f] : empty_string;
+                uint32_t vlen = static_cast<uint32_t>(v.size());
+                write(fd, &vlen, 4);
+                if (vlen > 0) write(fd, v.data(), vlen);
+            }
+        }
+        close(fd);
+    }
+
     // .meta
     {
         int fd = open((seg_prefix + ".meta").c_str(), O_CREAT | O_RDWR | O_TRUNC, 0644);
@@ -266,11 +357,13 @@ Result<std::shared_ptr<const Segment>> MemorySegment::flush(
     std::vector<uint8_t> doc_buf;
     std::vector<uint8_t> fwd_buf;
     std::vector<uint8_t> idm_buf;
+    std::vector<uint8_t> store_buf;
 
     bool have_fst = load_file(seg_prefix + ".fst", fst_buf);
     bool have_doc = load_file(seg_prefix + ".doc", doc_buf);
     bool have_fwd = load_file(seg_prefix + ".fwd", fwd_buf);
     bool have_idm = load_file(seg_prefix + ".idm", idm_buf);
+    bool have_store = load_file(seg_prefix + ".store", store_buf);
 
     if (have_fst) {
         segment->owned_fst_data_ = std::move(fst_buf);
@@ -289,6 +382,11 @@ Result<std::shared_ptr<const Segment>> MemorySegment::flush(
     }
     if (have_idm) {
         segment->load_idm(idm_buf.data(), idm_buf.size());
+    }
+    if (have_store) {
+        segment->owned_store_data_ = std::move(store_buf);
+        segment->load_store(segment->owned_store_data_.data(),
+                            segment->owned_store_data_.size());
     }
 
     // Init empty delete bitmap

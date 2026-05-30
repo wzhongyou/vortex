@@ -32,6 +32,7 @@ struct Segment {
     Status load_forward_index(const uint8_t* data, size_t len);
     Status load_deletes(const uint8_t* data, size_t len);
     Status load_idm(const uint8_t* data, size_t len);
+    Status load_store(const uint8_t* data, size_t len);
 
     TermDict* term_dict() const { return term_dict_.get(); }
     ForwardIndex* forward_index() const { return fwd_.get(); }
@@ -41,6 +42,10 @@ struct Segment {
     const uint8_t* posting_data() const;
     size_t posting_data_len() const;
     std::string resolve_external_id(uint32_t doc_id) const;
+    uint32_t find_doc_id(std::string_view external_id) const;
+    void get_stored_values(uint32_t doc_id,
+                           std::vector<std::string>& out_values,
+                           uint16_t stored_field_count) const;
 
 private:
     uint64_t id_;
@@ -58,8 +63,13 @@ private:
     std::vector<uint8_t> owned_posting_data_;
     std::vector<uint8_t> owned_fwd_data_;
     std::vector<uint8_t> owned_idm_data_;
+    std::vector<uint8_t> owned_store_data_;
+
+    // Reverse external_id → doc_id mapping, built during load_idm().
+    std::unordered_map<std::string, uint32_t> ext_id_to_doc_;
 
     friend struct MemorySegment;  // flush() sets owned data
+    friend class SegmentMerger;   // merge() reads owned data
 };
 
 // Mutable in-memory segment being built.
@@ -70,6 +80,7 @@ struct MemorySegment {
     void add_doc_info(uint32_t doc_length,
                       const std::vector<uint32_t>& field_lengths);
     void add_external_id(std::string_view external_id);
+    void add_stored_values(std::vector<std::string> values);
 
     Result<std::shared_ptr<const Segment>> flush(
         const std::string& segment_dir, Arena& arena);
@@ -89,6 +100,7 @@ private:
     std::vector<uint32_t> doc_lengths_;
     std::vector<std::vector<uint32_t>> field_lengths_;
     std::vector<std::string> external_ids_;
+    std::vector<std::vector<std::string>> stored_values_;
 };
 
 }  // namespace vortex

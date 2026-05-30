@@ -1,5 +1,7 @@
 #include "vortex/inverted/segment_list.h"
 
+#include <algorithm>
+
 #include "vortex/inverted/segment.h"
 
 namespace vortex {
@@ -40,6 +42,31 @@ void SegmentList::publish_segment(std::shared_ptr<const Segment> seg) {
     current_.store(snap, std::memory_order_release);
 
     // Retire old snapshot
+    retired_.push_back(old);
+}
+
+void SegmentList::remove_segments(const std::vector<uint64_t>& segment_ids) {
+    auto* old = current_.load();
+    auto* snap = new SegmentsSnapshot();
+    snap->epoch_id = next_epoch_++;
+
+    for (auto& seg : old->segments) {
+        if (std::find(segment_ids.begin(), segment_ids.end(), seg->id()) == segment_ids.end()) {
+            snap->segments.push_back(seg);
+        }
+    }
+
+    // Recompute statistics
+    uint64_t total_docs = 0;
+    uint64_t total_terms = 0;
+    for (auto& s : snap->segments) {
+        total_docs += s->doc_count();
+        total_terms += static_cast<uint64_t>(s->avgdl() * s->doc_count());
+    }
+    snap->total_docs = total_docs;
+    snap->avgdl = total_docs > 0 ? static_cast<double>(total_terms) / total_docs : 0.0;
+
+    current_.store(snap, std::memory_order_release);
     retired_.push_back(old);
 }
 

@@ -127,6 +127,24 @@ Status IndexWriter::add_document(const Document& doc) {
 
     active_segment_->add_doc_info(total_doc_length, field_lengths);
 
+    // Collect stored field values in schema field order
+    if (opts_.schema.stored_field_count() > 0) {
+        std::vector<std::string> stored_values(opts_.schema.stored_field_count());
+        uint16_t si = 0;
+        for (auto& fs : opts_.schema.fields) {
+            if (fs.stored) {
+                for (auto& fv : doc.fields) {
+                    if (fv.name == fs.name) {
+                        stored_values[si] = fv.value;
+                        break;
+                    }
+                }
+                si++;
+            }
+        }
+        active_segment_->add_stored_values(std::move(stored_values));
+    }
+
     // Check flush threshold
     if (active_arena_->allocated() >= opts_.ram_buffer_mb * 1024 * 1024) {
         Status fs = flush();
@@ -180,7 +198,8 @@ Status IndexWriter::flush() {
 
 Result<std::shared_ptr<IndexReader>> IndexWriter::get_reader() {
     auto* snap = segment_list_->acquire_snapshot();
-    auto reader = std::shared_ptr<IndexReader>(new IndexReader(const_cast<SegmentsSnapshot*>(snap), segment_list_.get()));
+    auto reader = std::shared_ptr<IndexReader>(new IndexReader(
+        const_cast<SegmentsSnapshot*>(snap), segment_list_.get(), &opts_.schema));
     return Result<std::shared_ptr<IndexReader>>::Ok(std::move(reader));
 }
 

@@ -27,6 +27,7 @@ struct SegmentList {
     void release_snapshot(SegmentsSnapshot* snap);
 
     void publish_segment(std::shared_ptr<const Segment> seg);
+    void remove_segments(const std::vector<uint64_t>& segment_ids);
     void reclaim_retired_snapshots();
 
 private:

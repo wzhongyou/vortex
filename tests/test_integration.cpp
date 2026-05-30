@@ -354,5 +354,150 @@ TEST_F(IntegrationTest, NestedBooleanQuery) {
     EXPECT_EQ(result2.value().total_hits, 2u);
 }
 
+TEST_F(IntegrationTest, GetDocumentReturnsStoredFields) {
+    Schema schema;
+    ASSERT_TRUE(schema.add_field({"title", FieldType::TEXT, true, true}).ok());
+    ASSERT_TRUE(schema.add_field({"content", FieldType::TEXT, false, true}).ok());
+    ASSERT_TRUE(schema.add_field({"doc_id", FieldType::KEYWORD, true, false}).ok());
+    ASSERT_TRUE(schema.add_field({"category", FieldType::KEYWORD, true, false}).ok());
+
+    IndexWriterOptions opts;
+    opts.index_dir = test_dir_;
+    opts.schema = std::move(schema);
+    opts.external_id_field = "doc_id";
+    opts.ram_buffer_mb = 64;
+
+    auto writer_result = IndexWriter::open(std::move(opts));
+    ASSERT_TRUE(writer_result.ok());
+    auto writer = writer_result.move_value();
+
+    {
+        Document doc;
+        doc.fields.push_back({"doc_id", "1"});
+        doc.fields.push_back({"title", "Hello World"});
+        doc.fields.push_back({"content", "A hello world doc"});
+        doc.fields.push_back({"category", "tech"});
+        ASSERT_TRUE(writer->add_document(doc).ok());
+    }
+    {
+        Document doc;
+        doc.fields.push_back({"doc_id", "2"});
+        doc.fields.push_back({"title", "Vortex Engine"});
+        doc.fields.push_back({"content", "Fast inverted index"});
+        doc.fields.push_back({"category", "tech"});
+        ASSERT_TRUE(writer->add_document(doc).ok());
+    }
+
+    ASSERT_TRUE(writer->flush().ok());
+    auto reader_result = writer->get_reader();
+    ASSERT_TRUE(reader_result.ok());
+    auto reader = reader_result.move_value();
+
+    // get_document for existing external_id
+    auto doc_opt = reader->get_document("1").move_value();
+    ASSERT_TRUE(doc_opt.has_value());
+    auto& doc = doc_opt.value();
+
+    // Verify all stored fields are returned with correct names and values
+    bool found_title = false, found_doc_id = false, found_category = false;
+    for (auto& fv : doc.fields) {
+        if (fv.name == "title") { EXPECT_EQ(fv.value, "Hello World"); found_title = true; }
+        else if (fv.name == "doc_id") { EXPECT_EQ(fv.value, "1"); found_doc_id = true; }
+        else if (fv.name == "category") { EXPECT_EQ(fv.value, "tech"); found_category = true; }
+    }
+    EXPECT_TRUE(found_title);
+    EXPECT_TRUE(found_doc_id);
+    EXPECT_TRUE(found_category);
+
+    // content has stored=false, so it should NOT appear
+    for (auto& fv : doc.fields) {
+        EXPECT_NE(fv.name, "content");
+    }
+}
+
+TEST_F(IntegrationTest, GetDocumentReturnsNulloptForNonexistentId) {
+    Schema schema;
+    ASSERT_TRUE(schema.add_field({"text", FieldType::TEXT, true, true}).ok());
+    ASSERT_TRUE(schema.add_field({"id", FieldType::KEYWORD, true, false}).ok());
+
+    IndexWriterOptions opts;
+    opts.index_dir = test_dir_;
+    opts.schema = std::move(schema);
+    opts.external_id_field = "id";
+    opts.ram_buffer_mb = 64;
+
+    auto writer_result = IndexWriter::open(std::move(opts));
+    ASSERT_TRUE(writer_result.ok());
+    auto writer = writer_result.move_value();
+
+    {
+        Document doc;
+        doc.fields.push_back({"id", "42"});
+        doc.fields.push_back({"text", "only document"});
+        ASSERT_TRUE(writer->add_document(doc).ok());
+    }
+    ASSERT_TRUE(writer->flush().ok());
+    auto reader_result = writer->get_reader();
+    ASSERT_TRUE(reader_result.ok());
+    auto reader = reader_result.move_value();
+
+    // Non-existent external_id
+    auto doc_opt = reader->get_document("nonexistent").move_value();
+    EXPECT_FALSE(doc_opt.has_value());
+
+    // Empty string
+    auto doc_opt2 = reader->get_document("").move_value();
+    EXPECT_FALSE(doc_opt2.has_value());
+}
+
+TEST_F(IntegrationTest, GetDocumentWorksAcrossMultipleSegments) {
+    Schema schema;
+    ASSERT_TRUE(schema.add_field({"title", FieldType::TEXT, true, true}).ok());
+    ASSERT_TRUE(schema.add_field({"id", FieldType::KEYWORD, true, false}).ok());
+
+    IndexWriterOptions opts;
+    opts.index_dir = test_dir_;
+    opts.schema = std::move(schema);
+    opts.external_id_field = "id";
+    opts.ram_buffer_mb = 1;  // tiny buffer to force frequent flushes
+
+    auto writer_result = IndexWriter::open(std::move(opts));
+    ASSERT_TRUE(writer_result.ok());
+    auto writer = writer_result.move_value();
+
+    // Add enough docs to trigger multiple flushes
+    for (int i = 1; i <= 50; i++) {
+        Document doc;
+        doc.fields.push_back({"id", std::to_string(i)});
+        doc.fields.push_back({"title", "Document number " + std::to_string(i)});
+        Status s = writer->add_document(doc);
+        if (!s.ok()) continue;  // may fail on duplicate flush-reset
+    }
+
+    writer->flush();
+    auto reader_result = writer->get_reader();
+    ASSERT_TRUE(reader_result.ok());
+    auto reader = reader_result.move_value();
+
+    // Verify we can retrieve docs from all segments
+    for (int i = 1; i <= 50; i++) {
+        auto ext_id = std::to_string(i);
+        auto doc_opt = reader->get_document(ext_id).move_value();
+        EXPECT_TRUE(doc_opt.has_value()) << "missing doc " << ext_id;
+        if (doc_opt.has_value()) {
+            bool found_id = false, found_title = false;
+            for (auto& fv : doc_opt.value().fields) {
+                if (fv.name == "id") found_id = true;
+                if (fv.name == "title") {
+                    EXPECT_EQ(fv.value, "Document number " + ext_id);
+                    found_title = true;
+                }
+            }
+            EXPECT_TRUE(found_id) << "id field missing for " << ext_id;
+            EXPECT_TRUE(found_title) << "title field missing for " << ext_id;
+        }
+    }
+}
+
 }  // namespace
 }  // namespace vortex
