@@ -102,6 +102,6 @@ auto result = reader->search(Query::Term("hello"), 10).move_value();
 
 - [倒排索引 V1 设计](docs/inverted_index_design_v1.md) — 段架构、FST、SIMD-BP128、WAL、BM25F、RCU 并发模型
 
-## License
+## 协议
 
 MIT — 见 [LICENSE](LICENSE)。

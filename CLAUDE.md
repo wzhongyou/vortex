@@ -1,54 +1,54 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+本文档指导 Claude Code 在此仓库中的代码协助工作。
 
-## Project
+## 项目
 
-Vortex — a C++17 inverted index (full-text search) engine. MIT licensed.
+Vortex — C++17 倒排索引（全文搜索）引擎。MIT 协议。
 
-## Build Commands
+## 构建命令
 
 ```bash
-# Configure (from repo root)
+# 配置（从仓库根目录）
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 
-# Build
+# 构建
 cmake --build build -j$(sysctl -n hw.ncpu)
 
-# Debug build with tests
+# Debug 构建含测试
 cmake -B build -DCMAKE_BUILD_TYPE=Debug -DVORTEX_BUILD_TESTS=ON
 cmake --build build -j$(sysctl -n hw.ncpu)
 
-# Run tests
+# 运行测试
 cd build && ctest --output-on-failure
 
-# Run a single test
+# 运行单个测试
 cd build && ctest -R <test_name> --output-on-failure
 
-# Run benchmarks
+# 运行基准测试
 cd build && ./benchmarks/vortex_benchmarks
 ```
 
-## Directory layout
+## 目录结构
 
 ```
 include/vortex/core/     # Arena, Document, Query, Schema, Stats, Status, Types
 include/vortex/inverted/ # Analyzer, FST Dict, PostingList, BM25F, Segment, WAL
-src/                     # Implementation (mirrors include/)
-tests/                   # GoogleTest unit tests
-examples/                # Usage example
-benchmarks/              # Google Benchmark micro-benchmarks
+src/                     # 实现文件（与 include 镜像）
+tests/                   # GoogleTest 单元测试
+examples/                # 使用示例
+benchmarks/              # Google Benchmark 基准测试
 ```
 
-## Code conventions
+## 代码规范
 
-- C++17, CMake 3.16+
-- Header-only where feasible for template-heavy code; `.cpp` for non-template logic
-- GoogleTest for tests, Google Benchmark for perf
-- Custom binary format for on-disk serialization (no FlatBuffers)
-- Namespace: `vortex::`
-- Include guard style: `#pragma once`
+- C++17，CMake 3.16+
+- 模板密集代码优先头文件，非模板逻辑放 `.cpp`
+- GoogleTest 测试，Google Benchmark 基准测试
+- 自定义二进制序列化（不使用 FlatBuffers）
+- 命名空间：`vortex::`
+- 头文件防护：`#pragma once`
 
-## Architecture
+## 架构
 
-See [README.md](README.md) for the four-layer architecture overview and design principles.
+详见 [README.md](README.md) 的四层架构概览和设计原则。
