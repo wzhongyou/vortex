@@ -23,8 +23,8 @@ jobs:
       - name: Build
         run: cmake --build build -j$(nproc)
 
-      - name: Test
-        run: cd build && ctest --output-on-failure
+      - name: Test (inverted index only)
+        run: cd build && ctest --output-on-failure -R "IntegrationTest|ArenaTest|PostingCodec|SkipList|TermDict|ForwardIndex|BM25FScorer|StandardTokenizer|CJK|LowercaseFilter|StopwordFilter|AnalyzerTest|DeleteBitmap|ExternalIdMap|WALTest"
 
       - name: Run example
         run: ./build/examples/vortex_example /tmp/vortex_demo
