@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cstring>
 #include <sstream>
+#include <string>
 
 #include "vortex/core/arena.h"
 #include "vortex/inverted/delete_bitmap.h"
@@ -49,6 +50,33 @@ Status Segment::load_deletes(const uint8_t* data, size_t len) {
     return Status::OK();
 }
 
+Status Segment::load_idm(const uint8_t* data, size_t len) {
+    owned_idm_data_.assign(data, data + len);
+    return Status::OK();
+}
+
+std::string Segment::resolve_external_id(uint32_t doc_id) const {
+    if (owned_idm_data_.empty()) return std::to_string(doc_id);
+    const uint8_t* p = owned_idm_data_.data();
+    size_t len = owned_idm_data_.size();
+    uint32_t count;
+    if (len < 4) return std::to_string(doc_id);
+    std::memcpy(&count, p, 4);
+    if (doc_id >= count) return std::to_string(doc_id);
+    p += 4;
+    for (uint32_t i = 0; i < doc_id; i++) {
+        if (p + 2 > owned_idm_data_.data() + len) return std::to_string(doc_id);
+        uint16_t slen;
+        std::memcpy(&slen, p, 2);
+        p += 2 + slen;
+    }
+    if (p + 2 > owned_idm_data_.data() + len) return std::to_string(doc_id);
+    uint16_t slen;
+    std::memcpy(&slen, p, 2);
+    if (p + 2 + slen > owned_idm_data_.data() + len) return std::to_string(doc_id);
+    return std::string(reinterpret_cast<const char*>(p + 2), slen);
+}
+
 const TermInfo* Segment::lookup_term(std::string_view term) const {
     if (!term_dict_) return nullptr;
     return term_dict_->lookup(term);
@@ -78,6 +106,10 @@ void MemorySegment::add_doc_info(uint32_t doc_length,
     field_lengths_.push_back(field_lengths);
     doc_count_++;
     total_terms_ += doc_length;
+}
+
+void MemorySegment::add_external_id(std::string_view external_id) {
+    external_ids_.emplace_back(external_id);
 }
 
 Result<std::shared_ptr<const Segment>> MemorySegment::flush(
@@ -184,6 +216,22 @@ Result<std::shared_ptr<const Segment>> MemorySegment::flush(
         close(fd);
     }
 
+    // .idm
+    {
+        int fd = open((seg_prefix + ".idm").c_str(), O_CREAT | O_RDWR | O_TRUNC, 0644);
+        if (fd < 0) return Result<std::shared_ptr<const Segment>>::Err(
+            Status::IOError("cannot create .idm"));
+
+        uint32_t count = static_cast<uint32_t>(external_ids_.size());
+        write(fd, &count, 4);
+        for (auto& ext_id : external_ids_) {
+            uint16_t slen = static_cast<uint16_t>(ext_id.size());
+            write(fd, &slen, 2);
+            write(fd, ext_id.data(), slen);
+        }
+        close(fd);
+    }
+
     // .meta
     {
         int fd = open((seg_prefix + ".meta").c_str(), O_CREAT | O_RDWR | O_TRUNC, 0644);
@@ -217,10 +265,12 @@ Result<std::shared_ptr<const Segment>> MemorySegment::flush(
     std::vector<uint8_t> fst_buf;
     std::vector<uint8_t> doc_buf;
     std::vector<uint8_t> fwd_buf;
+    std::vector<uint8_t> idm_buf;
 
     bool have_fst = load_file(seg_prefix + ".fst", fst_buf);
     bool have_doc = load_file(seg_prefix + ".doc", doc_buf);
     bool have_fwd = load_file(seg_prefix + ".fwd", fwd_buf);
+    bool have_idm = load_file(seg_prefix + ".idm", idm_buf);
 
     if (have_fst) {
         segment->owned_fst_data_ = std::move(fst_buf);
@@ -236,6 +286,9 @@ Result<std::shared_ptr<const Segment>> MemorySegment::flush(
         segment->owned_fwd_data_ = std::move(fwd_buf);
         segment->load_forward_index(segment->owned_fwd_data_.data(),
                                     segment->owned_fwd_data_.size());
+    }
+    if (have_idm) {
+        segment->load_idm(idm_buf.data(), idm_buf.size());
     }
 
     // Init empty delete bitmap

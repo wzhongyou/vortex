@@ -33,6 +33,12 @@ struct Query {
         subs.push_back(std::move(q));
         return {QueryType::NOT, {}, std::move(subs)};
     }
+    static Query Not(Query positive, Query negative) {
+        std::vector<Query> subs;
+        subs.push_back(std::move(positive));
+        subs.push_back(std::move(negative));
+        return {QueryType::NOT, {}, std::move(subs)};
+    }
 };
 
 }  // namespace vortex

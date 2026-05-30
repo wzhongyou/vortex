@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <queue>
+#include <unordered_map>
 #include "vortex/inverted/forward_index.h"
 #include "vortex/inverted/delete_bitmap.h"
 #include "vortex/inverted/term_dict.h"
@@ -39,32 +40,181 @@ struct ScoredEntry {
     }
 };
 
-// Execute a single TERM query against one segment
+// ── Forward declarations ──
+
+static void search_query_in_segment(const Segment& seg,
+                                     const Query& query,
+                                     const Scorer& scorer,
+                                     std::vector<ScoredEntry>& out);
+
+// ── TERM ──
+
 static void search_term_in_segment(const Segment& seg,
                                     const std::string& term,
-                                    const BM25FScorer& scorer,
+                                    const Scorer& scorer,
                                     std::vector<ScoredEntry>& out) {
     const TermInfo* info = seg.lookup_term(term);
     if (!info) return;
 
-    // Build PostingListReader over just this term's posting data
     const uint8_t* term_data = seg.posting_data() + info->posting_offset;
     PostingListReader plr(term_data, info->posting_len);
 
     plr.for_each([&](uint32_t doc_id, uint32_t tf) {
-        // Check if deleted
         if (seg.deletes() && seg.deletes()->is_deleted(doc_id)) return;
 
-        // Get forward info for this doc
         auto doc_info = seg.forward_index()
                             ? seg.forward_index()->get(doc_id)
                             : ForwardIndex::DocInfo{0, nullptr};
 
-        // Score
         double s = scorer.score(tf, info->doc_freq, doc_info.doc_length);
         out.push_back({static_cast<float>(s), doc_id, seg.id()});
     });
 }
+
+// ── AND ──
+
+static void search_and_in_segment(const Segment& seg,
+                                   const std::vector<Query>& sub_queries,
+                                   const Scorer& scorer,
+                                   std::vector<ScoredEntry>& out) {
+    if (sub_queries.empty()) return;
+
+    std::vector<std::vector<ScoredEntry>> sub_results(sub_queries.size());
+    for (size_t i = 0; i < sub_queries.size(); i++) {
+        search_query_in_segment(seg, sub_queries[i], scorer, sub_results[i]);
+        std::sort(sub_results[i].begin(), sub_results[i].end(),
+                  [](const ScoredEntry& a, const ScoredEntry& b) {
+                      return a.doc_id < b.doc_id;
+                  });
+    }
+
+    // Drive intersection from the smallest result set
+    size_t driver_idx = 0;
+    for (size_t i = 1; i < sub_results.size(); i++) {
+        if (sub_results[i].size() < sub_results[driver_idx].size()) {
+            driver_idx = i;
+        }
+    }
+
+    for (auto& entry : sub_results[driver_idx]) {
+        double combined = entry.score;
+        bool all_match = true;
+
+        for (size_t i = 0; i < sub_results.size(); i++) {
+            if (i == driver_idx) continue;
+            auto& set = sub_results[i];
+            auto it = std::lower_bound(set.begin(), set.end(), entry.doc_id,
+                [](const ScoredEntry& e, uint32_t doc_id) { return e.doc_id < doc_id; });
+            if (it == set.end() || it->doc_id != entry.doc_id) {
+                all_match = false;
+                break;
+            }
+            combined += it->score;
+        }
+
+        if (all_match) {
+            out.push_back({static_cast<float>(combined), entry.doc_id, seg.id()});
+        }
+    }
+}
+
+// ── OR ──
+
+static void search_or_in_segment(const Segment& seg,
+                                  const std::vector<Query>& sub_queries,
+                                  const Scorer& scorer,
+                                  std::vector<ScoredEntry>& out) {
+    if (sub_queries.empty()) return;
+
+    std::vector<std::vector<ScoredEntry>> sub_results(sub_queries.size());
+    for (size_t i = 0; i < sub_queries.size(); i++) {
+        search_query_in_segment(seg, sub_queries[i], scorer, sub_results[i]);
+    }
+
+    if (sub_results.size() == 1) {
+        out = std::move(sub_results[0]);
+        return;
+    }
+
+    // Union: map doc_id to max score across all sub-results
+    std::unordered_map<uint32_t, float> doc_scores;
+    for (auto& set : sub_results) {
+        for (auto& entry : set) {
+            auto it = doc_scores.find(entry.doc_id);
+            if (it == doc_scores.end() || entry.score > it->second) {
+                doc_scores[entry.doc_id] = entry.score;
+            }
+        }
+    }
+
+    out.reserve(doc_scores.size());
+    for (auto& pair : doc_scores) {
+        out.push_back({pair.second, pair.first, seg.id()});
+    }
+}
+
+// ── NOT ──
+
+static void search_not_in_segment(const Segment& seg,
+                                   const std::vector<Query>& sub_queries,
+                                   const Scorer& scorer,
+                                   std::vector<ScoredEntry>& out) {
+    if (sub_queries.empty()) return;
+
+    // First sub-query is the positive set
+    search_query_in_segment(seg, sub_queries[0], scorer, out);
+
+    // Second sub-query (if any) is the negative (exclusion) set
+    if (sub_queries.size() >= 2) {
+        std::vector<ScoredEntry> exclude;
+        search_query_in_segment(seg, sub_queries[1], scorer, exclude);
+
+        if (!exclude.empty()) {
+            std::sort(exclude.begin(), exclude.end(),
+                      [](const ScoredEntry& a, const ScoredEntry& b) {
+                          return a.doc_id < b.doc_id;
+                      });
+
+            std::vector<ScoredEntry> filtered;
+            filtered.reserve(out.size());
+            for (auto& entry : out) {
+                auto it = std::lower_bound(exclude.begin(), exclude.end(), entry.doc_id,
+                    [](const ScoredEntry& e, uint32_t doc_id) { return e.doc_id < doc_id; });
+                if (it == exclude.end() || it->doc_id != entry.doc_id) {
+                    filtered.push_back(entry);
+                }
+            }
+            out = std::move(filtered);
+        }
+    } else {
+        // Unary NOT: no positive base to match against
+        out.clear();
+    }
+}
+
+// ── Query dispatch ──
+
+static void search_query_in_segment(const Segment& seg,
+                                     const Query& query,
+                                     const Scorer& scorer,
+                                     std::vector<ScoredEntry>& out) {
+    switch (query.type) {
+        case QueryType::TERM:
+            search_term_in_segment(seg, query.term, scorer, out);
+            break;
+        case QueryType::AND:
+            search_and_in_segment(seg, query.sub_queries, scorer, out);
+            break;
+        case QueryType::OR:
+            search_or_in_segment(seg, query.sub_queries, scorer, out);
+            break;
+        case QueryType::NOT:
+            search_not_in_segment(seg, query.sub_queries, scorer, out);
+            break;
+    }
+}
+
+// ── Main search ──
 
 Result<SearchResult> IndexReader::search(const Query& query, size_t topk) {
     SearchResult result;
@@ -76,21 +226,10 @@ Result<SearchResult> IndexReader::search(const Query& query, size_t topk) {
         return Result<SearchResult>::Ok(std::move(result));
     }
 
-    // Collect all scored docs from all segments
+    // Execute query across all segments
     std::vector<ScoredEntry> all_results;
-
-    if (query.type == QueryType::TERM) {
-        for (auto& seg : snapshot_->segments) {
-            search_term_in_segment(*seg, query.term, *scorer_, all_results);
-        }
-    } else if (query.type == QueryType::AND) {
-        // AND: intersect posting lists across terms within each segment.
-        // V1: simplified — execute each sub-query independently and intersect.
-        // Full intersection with advance_to will be in V2.
-        (void)query; // not yet implemented for complex queries
-    } else if (query.type == QueryType::OR) {
-        // OR: union posting lists.
-        (void)query; // not yet implemented for complex queries
+    for (auto& seg : snapshot_->segments) {
+        search_query_in_segment(*seg, query, *scorer_, all_results);
     }
 
     // Sort by score descending, take topk
@@ -109,7 +248,13 @@ Result<SearchResult> IndexReader::search(const Query& query, size_t topk) {
         doc.score = entry.score;
         doc.segment_id = entry.segment_id;
         doc.internal_doc_id = entry.doc_id;
-        doc.external_id = std::to_string(entry.doc_id);  // placeholder
+        doc.external_id = std::to_string(entry.doc_id);
+        for (auto& seg : snapshot_->segments) {
+            if (seg->id() == entry.segment_id) {
+                doc.external_id = seg->resolve_external_id(entry.doc_id);
+                break;
+            }
+        }
         result.docs.push_back(std::move(doc));
     }
 

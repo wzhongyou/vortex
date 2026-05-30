@@ -1,24 +1,22 @@
 # Contributing to Vortex
 
-Thanks for your interest! Vortex is currently in the **planning phase** — early design discussions and contributions are welcome.
+Thanks for your interest! Vortex is an active C++17 inverted index engine.
 
 ## How to Contribute
 
-- **Design discussions** — participate in architecture and API design via GitHub Issues
+- **Bug reports / feature requests** — open GitHub Issues
 - **Code** — fork the repo, develop on a feature branch, submit PRs to `main`
-- **Documentation** — improvements and translations are also appreciated
+- **Documentation** — improvements and translations are welcome
 
 ## Development Environment
 
 - C++17 compiler (GCC 9+ / Clang 10+ / Apple Clang 14+)
 - CMake 3.16+
-- GoogleTest (testing) / Google Benchmark (benchmarks)
-- FlatBuffers (serialization)
 
 ```bash
 # Configure and build
 cmake -B build -DCMAKE_BUILD_TYPE=Debug -DVORTEX_BUILD_TESTS=ON
-cmake --build build -j$(nproc)
+cmake --build build -j$(sysctl -n hw.ncpu)
 
 # Run tests
 cd build && ctest --output-on-failure

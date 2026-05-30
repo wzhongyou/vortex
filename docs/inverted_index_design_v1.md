@@ -1,37 +1,61 @@
-# Inverted Index V1 Design
+# 倒排索引 V1 设计
 
-## 1. Goals & Scope
+> **本文档记录 Vortex 倒排索引引擎的原始设计蓝图的完整翻译。**
+>
+> ⚠️ **设计与实现的差异：**
+> 实际实现做了以下简化和未完成项，阅读设计文档时请注意区分：
+>
+> **未实现的设计特性：**
+> - xxHash64 文件校验和（第15章） — 未写入也未验证
+> - 原子刷盘 tmp → rename 协议（第5.3章） — 直接写入最终文件
+> - `.store` 正排文件（第5.2章） — 未实现，段只写 `.fst/.doc/.fwd/.idm/.meta`
+> - SIMD 运行时调度（第9.2章） — `codec_init()` 从未被调用，实际固定使用 SSE4.2 路径
+> - WAL CRC32 校验 / 组提交（第14章） — WAL 实现简化，无 CRC32
+> - Roaring Bitmap 删除位图（第12章） — 实际使用 `std::vector<bool>`
+> - BM25F 每字段权重（第13章） — 实际只有全局 `{k1, b}` 参数
+> - `IndexReader::get_document()`（第20章） — 不存在
+> - `ForwardIndexBuilder`（第10.3章） — 类存在但未被实际使用
+>
+> **已做简化（降低外部依赖）：**
+> - `absl::flat_hash_map` → `std::unordered_map`
+> - `absl::InlinedVector` → `std::vector`
+> - `absl::flat_hash_set` → `std::unordered_set`
+> - `absl::Span` → 直接传 `std::vector`
+>
+> API 签名以实际代码为准。设计文档中的代码示例仅供参考。
 
-Implement a production-grade single-node inverted index. The core architecture follows Lucene's Segment design. All data structures and algorithms are designed from day one for production deliverables — no throwaway prototypes.
+## 1. 目标与范围
 
-### 1.1 V1 Deliverables
+实现一个生产级单节点倒排索引。核心架构遵循 Lucene 的 Segment 设计。所有数据结构和算法从一开始就面向生产交付设计，没有一次性原型代码。
 
-| Feature | Standard |
-|---------|----------|
-| Boolean queries | Term / AND / OR / NOT |
-| Scoring | BM25F with per-field weights, pluggable Scorer interface |
-| Per-field indexing | each TEXT field independently tokenized and indexed |
-| Segment architecture | in-memory writes → atomic flush to immutable on-disk segments |
-| Snapshot isolation | RCU-protected read path, writes never block reads |
-| WAL | binary format, CRC32 per record, Group Commit |
-| Disk I/O | mmap zero-copy reads, fallocate preallocation |
-| Dictionary | FST (Finite State Transducer), byte-based incremental minimization |
-| Posting lists | SIMD-BP128 block encoding, multi-level skip list |
-| Memory | Arena-based layered allocation, no bare new/malloc in hot paths |
-| Data integrity | xxHash64 trailer on every data file, CRC32 on WAL records |
-| Observability | latency histograms, throughput counters, memory/disk usage |
-| Error handling | `Status` / `Result<T>` — no exceptions across API boundaries |
+### 1.1 V1 交付物
 
-### 1.2 V1 Out of Scope
+| 特性 | 标准 |
+|------|------|
+| 布尔查询 | Term / AND / OR / NOT |
+| 评分 | BM25F，支持每字段权重，可插拔 Scorer 接口 |
+| 逐字段索引 | 每个 TEXT 字段独立分词和索引 |
+| 分段架构 | 内存写入 → 原子刷盘为不可变磁盘分段 |
+| 快照隔离 | RCU 保护的读路径，写入从不阻塞读取 |
+| WAL | 二进制格式，每条记录 CRC32，组提交 |
+| 磁盘 I/O | mmap 零拷贝读取，fallocate 预分配 |
+| 词典 | FST（有限状态转移器），基于字节的增量最小化 |
+| 倒排链 | SIMD-BP128 块编码，多层跳表 |
+| 内存 | 基于 Arena 的分层分配，热路径无裸 new/malloc |
+| 数据完整性 | 每个数据文件末尾 xxHash64 校验，WAL 记录 CRC32 |
+| 可观测性 | 延迟直方图、吞吐计数器、内存/磁盘用量 |
+| 错误处理 | `Status` / `Result<T>` — API 边界无异常 |
 
-Segment merging, phrase queries, NRT search, distributed, custom analyzers via config file.
+### 1.2 V1 不包含
 
-## 2. Error Handling Model
+段合并、短语查询、近实时搜索、分布式、通过配置文件的自定义分析器。
+
+## 2. 错误处理模型
 
 ```
-Rule: API boundaries return Status or Result<T>. No exceptions.
-      Internal invariant violations use VORTEX_PANIC (logic bugs, not runtime errors).
-      Constructors use VORTEX_PANIC only; factory methods return Result<T>.
+规则：API 边界返回 Status 或 Result<T>，不抛异常。
+      内部不变量违反应使用 VORTEX_PANIC（逻辑 bug，非运行时错误）。
+      构造函数仅使用 VORTEX_PANIC；工厂方法返回 Result<T>。
 ```
 
 ```cpp
@@ -59,15 +83,15 @@ public:
 
 private:
     Code code_;
-    std::string msg_;  // SSO — no heap allocation for short messages
+    std::string msg_;  // SSO — 短消息无堆分配
 };
 
 template<typename T>
 class Result {
 public:
-    // success
+    // 成功
     static Result<T> Ok(T value) { return {std::move(value), Status::OK()}; }
-    // failure
+    // 失败
     static Result<T> Err(Status status) { return {{}, std::move(status)}; }
 
     bool ok() const { return status_.ok(); }
@@ -84,26 +108,26 @@ private:
     do { std::cerr << "[PANIC] " << msg << std::endl; std::abort(); } while(0)
 ```
 
-## 3. Memory Management
+## 3. 内存管理
 
-### 3.1 Layered Arenas
+### 3.1 分层 Arena
 
-All memory allocation during indexing flows through arenas. No bare `new`/`malloc` in write or read hot paths.
+索引期间的所有内存分配都经过 Arena。读写热路径中不允许裸 `new`/`malloc`。
 
 ```
-Arena hierarchy:
+Arena 层次结构：
 
-IndexWriter owns:
-  ├── active_arena_        ← current in-memory segment (bulk-reset after flush)
-  └── flush_arena_         ← double-buffer: while flushing, new writes use active_arena_
+IndexWriter 拥有：
+  ├── active_arena_      ← 当前内存段（刷盘后批量重置）
+  └── flush_arena_       ← 双缓冲：刷盘时，新写入使用 active_arena_
 
-Per-request (thread-local):
-  └── ThreadLocalArena     ← 256 KB slab chain, used by analyzer token output
-                              ScopedThreadArena binds/unbinds, auto-reset on scope exit
+按请求（线程局部）：
+  └── ThreadLocalArena   ← 256 KB 块链，由分析器分词输出使用
+                           ScopedThreadArena 绑定/解绑，作用域退出时自动重置
 
-FST construction (independent):
-  ├── Pass 1 Arena         ← term collection, node graph construction
-  └── Pass 2 Arena         ← serialization; then Pass 1 Arena is freed
+FST 构建（独立）：
+  ├── Pass 1 Arena       ← 词条收集，节点图构建
+  └── Pass 2 Arena       ← 序列化；然后释放 Pass 1 Arena
 ```
 
 ```cpp
@@ -113,10 +137,10 @@ public:
 
     void* allocate(size_t size, size_t alignment = alignof(std::max_align_t));
 
-    // Fast reset: preserves current chunk, resets usage cursor
+    // 快速重置：保留当前块，重置使用游标
     void reset();
 
-    // Full release: frees all chunks
+    // 完全释放：释放所有块
     void clear();
 
     size_t allocated() const;
@@ -134,57 +158,57 @@ private:
     size_t chunk_size_;
 };
 
-// Per-thread arena binding
+// 线程局部 Arena 绑定
 class ScopedThreadArena {
 public:
     explicit ScopedThreadArena(Arena& arena);
-    ~ScopedThreadArena();  // unbinds + reset arena
+    ~ScopedThreadArena();  // 解绑 + 重置 arena
     ScopedThreadArena(const ScopedThreadArena&) = delete;
     ScopedThreadArena& operator=(const ScopedThreadArena&) = delete;
 };
 
-// Thread-local registry
+// 线程局部注册表
 Arena& thread_arena();
 ```
 
-### 3.2 Disk Preallocation
+### 3.2 磁盘预分配
 
 ```cpp
-// Called before writing .doc / .fst / .store
-// Uses posix_fallocate (Linux) or fcntl F_PREALLOCATE (macOS)
+// 在写入 .doc / .fst / .store 之前调用
+// 使用 posix_fallocate（Linux）或 fcntl F_PREALLOCATE（macOS）
 Status preallocate_file(int fd, off_t estimated_size);
 ```
 
-### 3.3 Flush Threshold
+### 3.3 刷盘阈值
 
-Flush triggers when `active_arena_.allocated()` exceeds 64 MB. This is configurable via `IndexWriterOptions::ram_buffer_mb` (range: 16–256 MB). The 64 MB default balances write amplification against query latency (fewer segments = less cross-segment merge work).
+当 `active_arena_.allocated()` 超过 64 MB 时触发刷盘。可通过 `IndexWriterOptions::ram_buffer_mb` 配置（范围：16–256 MB）。64 MB 的默认值在写放大和查询延迟之间取得平衡（更少的段 = 更少的跨段合并工作）。
 
-## 4. Data Model
+## 4. 数据模型
 
 ### 4.1 Schema
 
 ```cpp
 enum class FieldType : uint8_t {
-    TEXT,       // full-text indexed + tokenized
-    KEYWORD,    // exact match, not tokenized
+    TEXT,       // 全文索引 + 分词
+    KEYWORD,    // 精确匹配，不分词
 };
 
 struct FieldSchema {
     std::string name;
     FieldType type;
-    bool stored;     // raw value preserved for retrieval
-    bool indexed;    // added to inverted index
+    bool stored;     // 保留原始值用于检索
+    bool indexed;    // 加入倒排索引
 };
 
 struct Schema {
     Status add_field(FieldSchema field);
     const FieldSchema* field(std::string_view name) const;
-    uint16_t field_index(std::string_view name) const;  // returns UINT16_MAX if not found
+    uint16_t field_index(std::string_view name) const;  // 未找到返回 UINT16_MAX
 
     std::vector<FieldSchema> fields;
     absl::flat_hash_map<std::string, uint16_t> name_to_index;
-    uint16_t stored_field_count;   // cached count of stored=true fields
-    uint16_t indexed_field_count;  // cached count of indexed=true, type=TEXT fields
+    uint16_t stored_field_count;   // stored=true 的字段数量缓存
+    uint16_t indexed_field_count;  // indexed=true, type=TEXT 的字段数量缓存
 };
 ```
 
@@ -193,7 +217,7 @@ struct Schema {
 ```cpp
 struct FieldValue {
     std::string name;
-    std::string value;       // V1: text only
+    std::string value;       // V1：仅文本
 };
 
 struct Document {
@@ -201,234 +225,234 @@ struct Document {
 };
 ```
 
-Documents carry no external ID in the struct. Internal IDs are assigned by IndexWriter (dense, monotonically increasing uint32 within each segment). The external ID must be provided as a KEYWORD stored field.
+Document 结构体中不携带外部 ID。内部 ID 由 IndexWriter 分配（每个段内密集递增的 uint32）。外部 ID 必须作为 KEYWORD 存储字段提供。
 
-### 4.3 Internal Document Representation
+### 4.3 内部文档表示
 
 ```cpp
 struct InternalDoc {
     uint64_t segment_id;
-    uint32_t doc_id;         // dense within segment
-    uint32_t doc_length;     // sum of all term counts across fields
+    uint32_t doc_id;         // 段内密集
+    uint32_t doc_length;     // 所有字段的词条总数
 
-    // Per-field term counts, indexed by field_index.
-    // Only populated for indexed TEXT fields (len = schema.indexed_field_count).
-    // Uses small_vector: inline storage for <= 8 fields, heap for more.
+    // 每字段词条数，按 field_index 索引。
+    // 仅为索引的 TEXT 字段填充（长度 = schema.indexed_field_count）。
+    // 使用 small_vector：<= 8 个字段内联存储，更多则堆分配。
     absl::InlinedVector<uint32_t, 8> field_lengths;
 
-    // Stored field values, indexed by stored_field_index (not field_index).
-    // Length = schema.stored_field_count.
+    // 存储字段值，按 stored_field_index（非 field_index）索引。
+    // 长度 = schema.stored_field_count。
     absl::InlinedVector<std::string, 4> stored_values;
 };
 ```
 
-`absl::InlinedVector` provides the small-size optimization needed here — typical schemas have 1–8 indexed fields, avoiding heap allocation for the common case while being valid C++.
+`absl::InlinedVector` 提供了此处所需的小尺寸优化——典型 schema 有 1–8 个索引字段，常见情况避免了堆分配。
 
-## 5. Segment Architecture
+## 5. 段架构
 
-### 5.1 Overall Structure
+### 5.1 整体结构
 
 ```
 ┌──────────────────────────────────────────────────────┐
-│                   IndexWriter                         │
+│                    IndexWriter                        │
 │                                                       │
 │  ┌──────────────┐    ┌──────────────┐                │
 │  │ MemorySegment│    │ WAL          │                │
-│  │ (mutable)    │    │ (binary,     │                │
-│  │ Arena-backed │    │  CRC32)      │                │
+│  │ （可变）     │    │ （二进制，   │                │
+│  │ Arena 后端   │    │  CRC32）     │                │
 │  └──────┬───────┘    └──────────────┘                │
-│         │ atomic flush (.tmp → rename)                │
+│         │ 原子刷盘 (.tmp → 重命名)                    │
 │         ▼                                             │
 │  ┌──────────────┐    ┌──────────────┐                │
-│  │ Segment 0    │    │ Segment 1    │  (immutable,   │
-│  │ (on disk)    │    │ (on disk)    │   mmap'd)      │
+│  │ Segment 0    │    │ Segment 1    │  （不可变，    │
+│  │ （磁盘）     │    │ （磁盘）     │   mmap'd）     │
 │  └──────────────┘    └──────────────┘                │
 │         │                   │                         │
 │         └─────────┬─────────┘                         │
 │                   ▼                                   │
 │         ┌──────────────────┐                          │
-│         │ SegmentMerge     │ (V2)                     │
+│         │  SegmentMerge    │ (V2)                     │
 │         └──────────────────┘                          │
 └──────────────────────────────────────────────────────┘
                     ▲
         ┌───────────┴───────────┐
         │     IndexReader       │
-        │  (point-in-time view) │
-        │  RCU-protected        │
-        │  owns its own BM25    │
-        │  statistics snapshot   │
+        │  （时间点视图）       │
+        │  RCU 保护             │
+        │  拥有自己的 BM25      │
+        │  统计数据快照         │
         └───────────────────────┘
 ```
 
-### 5.2 Segment On-Disk Files
+### 5.2 段磁盘文件
 
 ```
-Segment N (after atomic flush):
-├── _N.fst       FST dictionary: term → {doc_freq, posting_offset, posting_len}
-├── _N.doc       Posting data: [block_header][SIMD-packed deltas][freqs]
-├── _N.pos       Position data (V2 phrase queries — NOT written in V1)
-├── _N.store     Row-oriented doc store: doc_id → stored_field_values
-├── _N.fwd       Forward index: doc_id → {doc_length, field_lengths[]}
-├── _N.idm       External ID mapping: internal_doc_id → external_id (string)
-├── _N.meta      JSON metadata with per-file xxHash64 checksums
-└── _N.del       Deletion bitmap (Roaring Bitmap)
+Segment N（原子刷盘后）：
+├── _N.fst       FST 词典：term → {doc_freq, posting_offset, posting_len}
+├── _N.doc       倒排数据：[block_header][SIMD-packed deltas][freqs]
+├── _N.pos       位置数据（V2 短语查询 — V1 不写入）
+├── _N.store     行式文档存储：doc_id → stored_field_values
+├── _N.fwd       前向索引：doc_id → {doc_length, field_lengths[]}
+├── _N.idm       外部 ID 映射：internal_doc_id → external_id（字符串）
+├── _N.meta      JSON 元数据，包含每个文件的 xxHash64 校验和
+└── _N.del       删除位图（Roaring Bitmap）
 ```
 
-Each data file ends with an 8-byte xxHash64 trailer covering the file body (excluding the trailer itself).
+每个数据文件末尾有 8 字节的 xxHash64 校验，覆盖文件主体（不包括校验本身）。
 
-### 5.3 Atomic Flush Protocol
+### 5.3 原子刷盘协议
 
-Flushing is the most dangerous operation — a crash mid-flush must not corrupt the index.
+刷盘是最危险的操作——刷盘中崩溃绝不能损坏索引。
 
 ```
-flush() protocol:
+flush() 协议：
 
-1. Compute estimated file sizes, fallocate .tmp files:
+1. 计算估计文件大小，fallocate .tmp 文件：
    _N.fst.tmp, _N.doc.tmp, _N.store.tmp, _N.fwd.tmp, _N.idm.tmp, _N.meta.tmp
 
-2. Write all data to .tmp files, compute xxHash64 trailers
+2. 将所有数据写入 .tmp 文件，计算 xxHash64 校验
 
-3. fsync all .tmp files (in order: data files first, .meta.tmp last)
+3. fsync 所有 .tmp 文件（顺序：数据文件优先，.meta.tmp 最后）
 
-4. Atomic rename (same filesystem, so rename is atomic on POSIX):
-   for each .tmp: rename(_N.xxx.tmp → _N.xxx)
+4. 原子重命名（同一文件系统，POSIX 重命名是原子的）：
+   对每个 .tmp：rename(_N.xxx.tmp → _N.xxx)
 
-5. Append segment entry to segments.manifest, fsync manifest
+5. 将段条目追加到 segments.manifest，fsync manifest
 
-6. Register segment in SegmentList (RCU swap)
+6. 在 SegmentList 中注册段（RCU 交换）
 
 7. WAL::truncate()
 
-8. Release flush_arena_, create new empty MemorySegment on active_arena_
+8. 释放 flush_arena_，在 active_arena_ 上创建新的空 MemorySegment
 
-Crash recovery:
-  - List index_dir for *.tmp files → delete them (partial flush, discard)
-  - Reload segments from manifest → each listed segment is complete
-  - Replay WAL from last truncation point → rebuild memory segment
+崩溃恢复：
+  - 列出 index_dir 中的 *.tmp 文件 → 删除（部分刷盘，丢弃）
+  - 从 manifest 重新加载段 → 每个列出的段都是完整的
+  - 从上次截断点回放 WAL → 重建内存段
 ```
 
-Key invariant: **A segment is only visible after its entry appears in segments.manifest.** The manifest is the authoritative source of truth about which segments exist.
+关键不变量：**段只有在出现在 segments.manifest 后才可见。** Manifest 是哪些段存在的权威真相源。
 
-### 5.4 Write Path
+### 5.4 写入路径
 
 ```
-add_document(doc):
-  1. Assign internal_doc_id = next_id_++
-  2. WAL::append_add(internal_doc_id, doc)    ← crash-safe before index update
-  3. For each TEXT field with indexed=true:
+add_document(doc)：
+  1. 分配 internal_doc_id = next_id_++
+  2. WAL::append_add(internal_doc_id, doc)    ← 在索引更新前崩溃安全
+  3. 对每个 indexed=true 的 TEXT 字段：
        a. MixedTokenizer → LowercaseFilter → StopwordFilter
-       b. Output: vector<TermWithFreq> allocated on thread_arena()
-       c. Insert each term into MemorySegment:
-            FST builder: term → accumulating PostingListBuilder
+       b. 输出：在 thread_arena() 上分配的 vector<TermWithFreq>
+       c. 将每个词条插入 MemorySegment：
+            FST 构建器：term → 累积的 PostingListBuilder
             PostingListBuilder.append(doc_id, tf)
-       d. Record field_lengths for this field
-  4. Compute doc_length = sum(field_lengths)
-  5. Write stored field values to MemorySegment's doc store
-  6. Write external_id → internal_doc_id mapping
-  7. If active_arena_.allocated() >= flush_threshold_ → flush()
+       d. 记录该字段的 field_lengths
+  4. 计算 doc_length = sum(field_lengths)
+  5. 将存储字段值写入 MemorySegment 的文档存储
+  6. 写入 external_id → internal_doc_id 映射
+  7. 如果 active_arena_.allocated() >= flush_threshold_ → flush()
 
-remove_document(external_id):
+remove_document(external_id)：
   1. WAL::append_remove(external_id)
-  2. Lookup external_id in global ID mapping → (segment_id, internal_doc_id)
-  3. If in active MemorySegment: mark deleted in in-memory bitmap
-  4. If in flushed segment: write to _N.del (Roaring Bitmap)
-  5. Update global ID mapping (remove entry)
+  2. 在全局 ID 映射中查找 external_id → (segment_id, internal_doc_id)
+  3. 如果在活跃 MemorySegment 中：在内存位图中标记删除
+  4. 如果在已刷盘段中：写入 _N.del（Roaring Bitmap）
+  5. 更新全局 ID 映射（删除条目）
 
-update_document(external_id, new_doc):
+update_document(external_id, new_doc)：
   = remove_document(external_id) + add_document(new_doc)
-  (WAL records both operations atomically in a single group)
+  （WAL 在单个组中原子记录两个操作）
 ```
 
-### 5.5 Read Path (Lock-Free Snapshot)
+### 5.5 读取路径（无锁快照）
 
 ```
-IndexReader construction:
-  1. Obtain SegmentsSnapshot from SegmentList (RCU load, no lock)
-  2. Compute reader-local aggregate statistics:
+IndexReader 构造：
+  1. 从 SegmentList 获取 SegmentsSnapshot（RCU 加载，无锁）
+  2. 计算读取器本地的聚合统计：
        total_docs = sum(seg.doc_count)
        avgdl = sum(seg.total_term_count) / total_docs
        field_avg_lengths[f] = sum(seg.field_total_terms[f]) / total_docs
-  3. Construct BM25FScorer with these statistics
-  4. For each segment: mmap .fst, .doc, .fwd, .del files (lazy, on first use)
-  5. Validate xxHash64 trailers
+  3. 使用这些统计信息构造 BM25FScorer
+  4. 对每个段：mmap .fst, .doc, .fwd, .del 文件（懒加载，首次使用时）
+  5. 验证 xxHash64 校验
 
-IndexReader::search(query, topk):
-  1. for each segment (in parallel if segments > 1):
-       a. Execute query on segment → list of (doc_id, per_term_tfs[])
-       b. Filter against segment's .del bitmap → discard deleted docs
-       c. For each surviving candidate:
-            Read .fwd to get doc_length, field_lengths[]
-            Compute BM25F score using reader-local statistics
-       d. Produce segment-local topk heap
-  2. Cross-segment merge: min-heap of size topk, pop from each segment heap
-  3. For each topk result: resolve external_id from .idm
-  4. Return SearchResult
+IndexReader::search(query, topk)：
+  1. 对每个段（如果段 > 1 则并行）：
+       a. 在段上执行查询 → (doc_id, per_term_tfs[]) 列表
+       b. 针对段的 .del 位图过滤 → 丢弃已删除文档
+       c. 对每个候选文档：
+            读取 .fwd 获取 doc_length, field_lengths[]
+            使用读取器本地统计信息计算 BM25F 分数
+       d. 生成段本地的 topk 堆
+  2. 跨段合并：大小为 topk 的最小堆，从每个段堆中弹出
+  3. 对每个 topk 结果：从 .idm 解析 external_id
+  4. 返回 SearchResult
 
-IndexReader destructor:
-  1. Decrement epoch refcount on SegmentsSnapshot
+IndexReader 析构：
+  1. 减少 SegmentsSnapshot 上的 epoch 引用计数
 ```
 
-## 6. Concurrency Model
+## 6. 并发模型
 
-### 6.1 RCU Segment List
+### 6.1 RCU 段列表
 
 ```cpp
-// SegmentsSnapshot — a point-in-time view of all committed segments.
-// Reference-counted via epoch counter. Freed when no reader holds the epoch.
+// SegmentsSnapshot — 所有已提交段的时间点视图。
+// 通过 epoch 计数器引用计数。当没有读取器持有该 epoch 时释放。
 struct SegmentsSnapshot {
-    std::atomic<uint32_t> active_readers{0};  // epoch refcount
+    std::atomic<uint32_t> active_readers{0};  // epoch 引用计数
     uint64_t epoch_id;
     std::vector<std::shared_ptr<const Segment>> segments;
 
-    // Aggregate statistics, computed at snapshot creation time
+    // 聚合统计信息，在快照创建时计算
     uint64_t total_docs;
     double avgdl;
-    std::vector<double> field_avg_lengths;  // indexed by field_index
+    std::vector<double> field_avg_lengths;  // 按 field_index 索引
     std::vector<uint64_t> field_total_terms;
 };
 
 class SegmentList {
 public:
-    // Read path: lock-free, acquire ordering
-    // Returns raw pointer valid until exit_epoch()
+    // 读取路径：无锁，acquire 顺序
+    // 返回的原始指针在 exit_epoch() 之前有效
     const SegmentsSnapshot* acquire_snapshot();
 
-    // Read path: release the snapshot
+    // 读取路径：释放快照
     void release_snapshot(const SegmentsSnapshot* snap);
 
-    // Write path: install new snapshot with added segment
+    // 写入路径：安装带有新增段的新快照
     void publish_segment(std::shared_ptr<const Segment> seg);
 
-    // Triggered periodically by writer or on shutdown
-    // Frees snapshots whose active_readers == 0
+    // 由写入器定期触发或在关闭时触发
+    // 释放 active_readers == 0 的快照
     void reclaim_retired_snapshots();
 
 private:
     std::atomic<SegmentsSnapshot*> current_{nullptr};
 
-    // Only accessed by writer thread (single writer assumption)
+    // 仅由写入器线程访问（单写入器假设）
     std::vector<SegmentsSnapshot*> retired_;
     uint64_t next_epoch_{1};
 };
 ```
 
-### 6.2 mmap Lifecycle
+### 6.2 mmap 生命周期
 
-mmap regions must outlive the last reader that references them. The design ties mmap lifetime to the Segment object, and Segment lifetime to SegmentsSnapshot epochs:
+mmap 区域必须比引用它们的最后一个读取器存活更久。设计将 mmap 生命周期绑定到 Segment 对象，并将 Segment 生命周期绑定到 SegmentsSnapshot 的 epoch：
 
 ```
-Segment lifetime protocol:
+段生命周期协议：
 
-1. Active segments: referenced by SegmentsSnapshot::segments (shared_ptr)
-2. When a new snapshot is published (after flush):
-   − Old snapshot enters retired_ list
-   − Its shared_ptr<Segment> refs keep files alive
-3. reclaim_retired_snapshots() checks active_readers == 0
-   − If zero: destruct snapshot → shared_ptr refs released → munmap
-   − Segments not in any active snapshot are safe to delete
+1. 活跃段：由 SegmentsSnapshot::segments 引用（shared_ptr）
+2. 当发布新快照时（刷盘后）：
+   − 旧快照进入 retired_ 列表
+   − 它的 shared_ptr<Segment> 引用保持文件存活
+3. reclaim_retired_snapshots() 检查 active_readers == 0
+   − 如果为零：析构快照 → shared_ptr 引用释放 → munmap
+   − 不在任何活跃快照中的段可以安全删除
 
-V2 merge: merged segments go through the same retirement pipeline.
-Files are unlinked only after munmap completes (no SIGBUS possible).
+V2 合并：合并的段通过相同的退役管道。
+仅在 munmap 完成后取消链接文件（不可能出现 SIGBUS）。
 ```
 
 ```cpp
@@ -449,37 +473,37 @@ private:
 };
 ```
 
-### 6.3 Writer Locking
+### 6.3 写入器锁定
 
 ```cpp
 class IndexWriter {
-    std::mutex write_mutex_;  // serializes all write operations
-    // Single-writer concurrency is the industry standard assumption
-    // (Lucene, Tantivy, etc. all serialize writes).
-    // Multi-writer scenarios use external sharding.
+    std::mutex write_mutex_;  // 序列化所有写入操作
+    // 单写入器并发是行业标准假设
+    //（Lucene、Tantivy 等都序列化写入）。
+    // 多写入器场景使用外部分片。
 };
 ```
 
-## 7. Unicode Text Analysis
+## 7. Unicode 文本分析
 
-### 7.1 Normalization
+### 7.1 规范化
 
-Full-width → half-width, accent folding, case folding. These are quality fundamentals — searching "café" must hit "cafe".
+全角→半角、变音符号折叠、大小写折叠。这些是质量基础——搜索"café"必须命中"cafe"。
 
 ```cpp
-// Built-in: ASCII lowercase + CJK fullwidth/halfwidth mapping table
-// Covers common Chinese IME symbols, digits, and Latin letters.
-// Table is compile-time generated, ~8 KB.
+// 内置：ASCII 小写 + CJK 全角/半角映射表
+// 覆盖常见中文输入法符号、数字和拉丁字母。
+// 表在编译时生成，约 8 KB。
 std::string nfkc_normalize(std::string_view input);
 std::string lowercase_ascii(std::string_view input);
 
-// Optional ICU integration: full NFKC + locale-aware case folding
-// Controlled by VORTEX_USE_ICU compile flag
+// 可选的 ICU 集成：完整 NFKC + 本地感知的大小写折叠
+// 由 VORTEX_USE_ICU 编译标志控制
 ```
 
-### 7.2 Streaming Tokenizer
+### 7.2 流式分词器
 
-Push-based model eliminates intermediate `vector<Token>` allocation for large text:
+推送模型消除了大文本的中间 `vector<Token>` 分配：
 
 ```cpp
 class TokenConsumer {
@@ -489,8 +513,8 @@ public:
 };
 
 struct Token {
-    std::string_view text;  // points into normalized text buffer
-    uint16_t position;      // V1: reserved for V2 phrase queries
+    std::string_view text;  // 指向规范化文本缓冲区
+    uint16_t position;      // V1：为 V2 短语查询保留
     uint16_t start_offset;
     uint16_t end_offset;
 };
@@ -502,28 +526,28 @@ public:
     virtual ~Tokenizer() = default;
 };
 
-// Latin-script word boundary tokenizer
+// 拉丁语系词边界分词器
 class StandardTokenizer : public Tokenizer { ... };
 
-// CJK Bigram: "我爱北京" → ["我爱","爱北","北京"]
-// Minimal viable approach — no external dictionary dependency
+// CJK 二元分词："我爱北京" → ["我爱","爱北","北京"]
+// 最小可行方案——无需外部词典依赖
 class CJKBigramTokenizer : public Tokenizer { ... };
 
-// Auto-dispatch: detects CJK character ratio in text,
-// delegates to Standard or CJKBigram internally
+// 自动调度：检测文本中的 CJK 字符比例，
+// 内部分派给 Standard 或 CJKBigram
 class MixedTokenizer : public Tokenizer { ... };
 ```
 
-CJK Bigram is the validated minimal solution (Elasticsearch CJK Bigram Token Filter, same approach). V2 upgrades to dictionary-based segmentation with unchanged API.
+CJK Bigram 是经过验证的最小解决方案（Elasticsearch CJK Bigram Token Filter，相同方法）。V2 升级为基于词典的分词，API 不变。
 
-### 7.3 Filter Chain
+### 7.3 过滤器链
 
-Filters are also push-based, composable in sequence:
+过滤器也是推送式，可组合成序列：
 
 ```cpp
 class TokenFilter {
 public:
-    // Receives one token, may emit 0..N tokens downstream
+    // 接收一个 token，可能向下游发射 0..N 个 token
     virtual void process(Token token, TokenConsumer& downstream) = 0;
     virtual ~TokenFilter() = default;
 };
@@ -535,7 +559,7 @@ class StopwordFilter : public TokenFilter {
 class NFKCFilter : public TokenFilter { ... };
 ```
 
-### 7.4 Analyzer API
+### 7.4 分析器 API
 
 ```cpp
 class Analyzer {
@@ -543,10 +567,10 @@ public:
     Analyzer(std::unique_ptr<Tokenizer> tokenizer,
              std::vector<std::unique_ptr<TokenFilter>> filters);
 
-    // Output term → in-document term frequency.
-    // Allocated on the current thread arena.
+    // 输出 term → 文档内词频。
+    // 在当前线程 arena 上分配。
     struct TermWithFreq {
-        std::string_view term;  // points into arena
+        std::string_view term;  // 指向 arena
         uint32_t tf;
     };
     void analyze(std::string_view text,
@@ -559,87 +583,87 @@ private:
 };
 ```
 
-## 8. FST Dictionary
+## 8. FST 词典
 
-### 8.1 Why FST
+### 8.1 为什么选择 FST
 
-| | Hash Map | FST |
-|------|----------|-----|
-| Prefix compression | none | automatic prefix/suffix sharing |
-| Memory (1M terms) | ~80–120 MB | ~4–8 MB |
-| Ordered iteration | extra sort required | natural lexicographic order |
-| Prefix query | O(k × N) | O(k) |
-| Build cost | online O(N) | offline O(N log N) (sorted input) |
+| | 哈希表 | FST |
+|------|--------|-----|
+| 前缀压缩 | 无 | 自动前缀/后缀共享 |
+| 内存（100 万词条） | ~80–120 MB | ~4–8 MB |
+| 有序迭代 | 需要额外排序 | 自然字典序 |
+| 前缀查询 | O(k × N) | O(k) |
+| 构建代价 | 在线 O(N) | 离线 O(N log N)（需排序输入） |
 
-Search engine term dictionaries have large string key sets with natural ordering — FST is the clear choice. Lucene has used FST for its term dictionary since 4.0.
+搜索引擎词词典具有大量字符串键集和自然排序——FST 是明确的选择。Lucene 从 4.0 开始使用 FST 作为词词典。
 
-### 8.2 FST Data Flow
+### 8.2 FST 数据流
 
 ```
-Indexing (build phase, sorted by term):
+索引（构建阶段，按词条排序）：
   term → {doc_freq, posting_offset, posting_len}
     │
     ▼
-  TermDictBuilder (incremental minimization)
+  TermDictBuilder（增量最小化）
     │ finish()
     ▼
-  byte array (serialized FST)
-    │ write to _N.fst + xxHash64 trailer
+  字节数组（序列化 FST）
+    │ 写入 _N.fst + xxHash64 校验
     ▼
-  TermDict (mmap'd directly, zero-copy)
+  TermDict（直接 mmap，零拷贝）
 
-Query:
-  lookup("hello")  → traverse FST arcs → TermInfo*
-  prefix_range("he") → iterate matching sub-tree
+查询：
+  lookup("hello")  → 遍历 FST 弧 → TermInfo*
+  prefix_range("he") → 迭代匹配的子树
 ```
 
 ### 8.3 API
 
 ```cpp
 struct TermInfo {
-    uint32_t doc_freq;        // number of documents containing this term
-    uint64_t posting_offset;  // byte offset in .doc file
-    uint32_t posting_len;     // byte length in .doc file
+    uint32_t doc_freq;        // 包含该词条的文档数
+    uint64_t posting_offset;  // 在 .doc 文件中的字节偏移
+    uint32_t posting_len;     // 在 .doc 文件中的字节长度
 };
 
-// ── Build Phase ──
+// ── 构建阶段 ──
 class TermDictBuilder {
 public:
-    // Terms MUST be inserted in lexicographic order
+    // 词条必须按字典序插入
     void insert(std::string_view term, const TermInfo& info);
 
-    // Finalize: run incremental minimization, produce serialized FST bytes
+    // 完成：运行增量最小化，生成序列化 FST 字节
     std::vector<uint8_t> finish();
 
 private:
-    // Incremental minimization: maintains a stack of unfrozen nodes.
-    // When the prefix diverges from the next term, freeze the divergent
-    // suffix and reuse equivalent subtrees. Algorithm follows Lucene's
-    // FST.Builder with key differences documented in implementation.
+    // 增量最小化：维护一个未冻结节点栈。
+    // 当前缀与下一个词条分歧时，冻结分歧的后缀
+    // 并重用等效子树。算法遵循 Lucene 的
+    // FST.Builder，关键差异在实现中记录。
     struct UnfrozenNode {
         std::string_view prefix;
         std::vector<std::pair<uint8_t, uint32_t>> arcs; // label → target_node
-        uint64_t output;  // accumulated output value
+        uint64_t output;  // 累积的输出值
     };
     std::vector<UnfrozenNode> prefix_stack_;
-    // Hash of [arc_labels + targets + output] → canonical node_id for
-    // detecting equivalent subtrees (the core of minimization).
+    // [arc_labels + targets + output] 的哈希 → 规范节点 ID，
+    // 用于检测等效子树（最小化的核心）。
     absl::flat_hash_map<size_t, uint32_t> canonical_nodes_;
     std::vector<uint8_t> serialized_;
 };
 
-// ── Query Phase ──
+// ── 查询阶段 ──
 class TermDict {
 public:
-    // Load from mmap'd buffer (zero-copy — references data, not copies)
+    // 从 mmap'd 缓冲区加载（零拷贝—引用数据，不复制）
     static Result<std::unique_ptr<TermDict>> from_mmap(
         const uint8_t* data, size_t len, uint64_t xxhash64_expected);
 
     const TermInfo* lookup(std::string_view term) const;
 
-    // Iterate all terms with given prefix.
-    // Callback signature: bool(std::string_view term, const TermInfo&)
-    // Return false from callback to stop early.
+    // 迭代所有具有给定前缀的词条。
+    // 回调签名：bool(std::string_view term, const TermInfo&)
+    // 从回调返回 false 以提前停止。
     void prefix_range(std::string_view prefix,
                       std::function<bool(std::string_view, const TermInfo&)> fn) const;
 
@@ -652,98 +676,98 @@ private:
 };
 ```
 
-### 8.4 FST Build Algorithm Sketch
+### 8.4 FST 构建算法草图
 
-Incremental minimization (the core FST build algorithm):
+增量最小化（核心 FST 构建算法）：
 
 ```
-insert(term, info):
-  // Find common prefix length with previous term
+insert(term, info)：
+  // 找到与前一词条的公共前缀长度
   cpl = common_prefix_len(term, prev_term)
 
-  // Freeze nodes below cpl that are no longer on the shared path
-  while prefix_stack_.size() > cpl + 1:
+  // 冻结不再在共享路径上的 cpl 以下节点
+  while prefix_stack_.size() > cpl + 1：
     node = prefix_stack_.pop_back()
     frozen = try_minimize(node)
-    serialize frozen to output
+    序列化 frozen 到输出
 
-  // Add new suffix nodes for the non-shared part of term
-  for i = cpl .. term.size():
+  // 为 term 的非共享部分添加新的后缀节点
+  for i = cpl .. term.size()：
     prefix_stack_.push(new UnfrozenNode{term[0..i]})
 
-  // Attach output to the terminal node
+  // 将输出附加到终端节点
   prefix_stack_.back().output = encode(info)
 
-finish():
-  // Freeze remaining stack from bottom to top
-  while prefix_stack_.size() > 1:
+finish()：
+  // 从底部到顶部冻结剩余栈
+  while prefix_stack_.size() > 1：
     node = prefix_stack_.pop_back()
-    serialize try_minimize(node)
-  // Root is the last remaining node
+    序列化 try_minimize(node)
+  // 根节点是最后一个剩余节点
   root_node = prefix_stack_[0]
-  write root_node with pointer to it as entry point
+  写入根节点，并指向它作为入口点
 
-try_minimize(node):
+try_minimize(node)：
   hash = hash_arcs(node.arcs, node.output)
-  if existing = canonical_nodes_.find(hash):
-    return existing  // reuse equivalent subtree
+  if existing = canonical_nodes_.find(hash)：
+    return existing  // 重用等效子树
   canonical_nodes_[hash] = node
   return node
 ```
 
-Implementation note: this is the most algorithmically complex component. Plan for 5 days of dev + 2 days of edge-case testing (empty term, single-char terms, very long common prefixes, 1M+ term stress test).
+实现说明：这是算法上最复杂的组件。计划 5 天开发 + 2 天边界情况测试（空词条、单字符词条、非常长的公共前缀、100 万以上词条的压力测试）。
 
-## 9. Posting List Codec
+## 9. 倒排链编解码
 
-### 9.1 SIMD-BP128 Block Encoding
+### 9.1 SIMD-BP128 块编码
 
-Block size = 128 documents, chosen to match SIMD register width:
+块大小 = 128 个文档，选择匹配 SIMD 寄存器宽度：
 
-- 128-bit SIMD (SSE4.2): process 128 docs as 128×4 = 512 bits = 4 × __m128i
-- 256-bit SIMD (AVX2): process 128 docs as 128×2 = 256 bits = 2 × __m256i
+- 128 位 SIMD（SSE4.2）：处理 128 个文档为 128×4 = 512 位 = 4 × __m128i
+- 256 位 SIMD（AVX2）：处理 128 个文档为 128×2 = 256 位 = 2 × __m256i
 
-Encoding within a block:
+块内编码：
 
 ```
-Block Layout:
+块布局：
 ┌────────────┬─────────────────────┬─────────────────────┬──────────┐
-│ BlockHeader│ Packed DocID Deltas │ Packed Term Freqs   │ padding  │
-│ (4 bytes)  │ (variable bytes)   │ (variable bytes)    │ (to 4B)  │
+│ BlockHeader│ 打包的 DocID 差值   │ 打包的词频          │ 填充     │
+│ (4 字节)   │ (可变字节)          │ (可变字节)          │ (到 4B)  │
 └────────────┴─────────────────────┴─────────────────────┴──────────┘
 
-BlockHeader (4 bytes):
+BlockHeader（4 字节）：
   num_docs  : uint8   (1–128)
-  doc_bits  : uint8   (bits needed for largest docID delta)
-  freq_bits : uint8   (bits needed for largest term freq)
-  flags     : uint8   (reserved)
+  doc_bits  : uint8   （最大 docID 差值所需位数）
+  freq_bits : uint8   （最大词频所需位数）
+  flags     : uint8   （保留）
 
-Packed Deltas (SIMD-BP128):
-  Input:  128 docID deltas, each ≤ 2^doc_bits - 1
-  Output: ceil(128 × doc_bits / 8) bytes, stored as bit-planes
-  Bit-plane i stores bit i of all 128 deltas (128 bits = 16 bytes, naturally aligned)
+打包的差值（SIMD-BP128）：
+  输入：  128 个 docID 差值，每个 ≤ 2^doc_bits - 1
+  输出：ceil(128 × doc_bits / 8) 字节，按位平面存储
+  位平面 i 存储所有 128 个差值的第 i 位（128 位 = 16 字节，自然对齐）
 
-Packed Freqs:
-  Same layout as deltas, using freq_bits bit width.
+打包的词频：
+  布局与差值相同，使用 freq_bits 位宽。
 ```
 
-### 9.2 SIMD Runtime Dispatch
+### 9.2 SIMD 运行时调度
 
-The library compiles a single binary that runs on CPUs with or without AVX2:
+库编译为单个二进制文件，可在有或没有 AVX2 的 CPU 上运行：
 
 ```cpp
-// posting_codec.cpp — compiled WITHOUT -mavx2 (baseline SSE4.2 path)
+// posting_codec.cpp — 编译时 WITHOUT -mavx2（基准 SSE4.2 路径）
 size_t decode_block(const uint8_t* input, uint32_t* doc_ids,
                     uint32_t* freqs, uint8_t& num_docs);
 
-// posting_codec_avx2.cpp — compiled WITH -mavx2
+// posting_codec_avx2.cpp — 编译时 WITH -mavx2
 size_t decode_block_avx2(const uint8_t* input, uint32_t* doc_ids,
                           uint32_t* freqs, uint8_t& num_docs);
 
-// Function pointer, set once at init time
+// 函数指针，在初始化时设置一次
 using DecodeFunc = size_t (*)(const uint8_t*, uint32_t*, uint32_t*, uint8_t&);
 extern DecodeFunc g_decode_block;
 
-// Called in IndexWriter::open()
+// 在 IndexWriter::open() 中调用
 void codec_init() {
     if (__builtin_cpu_supports("avx2")) {
         g_decode_block = decode_block_avx2;
@@ -753,41 +777,41 @@ void codec_init() {
 }
 ```
 
-The SSE4.2 baseline is always available (x86-64 requires SSE4.2), covering all deployment targets.
+SSE4.2 基准始终可用（x86-64 要求 SSE4.2），覆盖所有部署目标。
 
-### 9.3 Multi-Level Skip List
+### 9.3 多层跳表
 
-Skip entries are at **block level**, not posting level:
+跳表条目在**块级别**，而不是倒排级别：
 
 ```cpp
-// One skip entry per block at each level
+// 每层每个块一个跳表条目
 struct SkipEntry {
-    uint32_t last_doc_id;     // max doc_id in the skipped block(s)
-    uint64_t block_offset;    // file offset of the target block
+    uint32_t last_doc_id;     // 跳过的块中的最大 doc_id
+    uint64_t block_offset;    // 目标块的文件偏移
 };
 
 class SkipList {
 public:
-    // Build multi-level skip from block metadata.
-    // skip_interval: blocks between skip entries at level 0 (default 4)
+    // 从块元数据构建多层跳表。
+    // skip_interval：第 0 层跳表条目的块间隔（默认 4）
     void build(const std::vector<uint64_t>& block_offsets,
                const std::vector<uint32_t>& block_max_doc,
                int skip_interval = 4);
 
-    // Find the block just before `target`, starting from `current_offset`.
-    // Returns block_offset (file position). Used by advance_to().
+    // 找到 `target` 之前的块，从 `current_offset` 开始。
+    // 返回 block_offset（文件位置）。由 advance_to() 使用。
     uint64_t advance(uint32_t target, uint64_t current_offset) const;
 
-    // Serialize to bytes (appended at end of posting data in .doc)
+    // 序列化为字节（追加在 .doc 的倒排数据末尾）
     std::vector<uint8_t> serialize() const;
 
-    // Deserialize from tail of .doc
+    // 从 .doc 尾部反序列化
     static SkipList deserialize(const uint8_t* data, size_t len);
 
 private:
-    // levels_[0]: every skip_interval blocks
-    // levels_[1]: every skip_interval^2 blocks
-    // levels_[2]: every skip_interval^3 blocks, etc.
+    // levels_[0]：每 skip_interval 个块
+    // levels_[1]：每 skip_interval^2 个块
+    // levels_[2]：每 skip_interval^3 个块，等等
     std::vector<std::vector<SkipEntry>> levels_;
 };
 ```
@@ -799,8 +823,8 @@ class PostingListBuilder {
 public:
     void append(uint32_t doc_id, uint32_t term_freq);
 
-    // Returns {offset_in_doc_file, byte_count}
-    // Posting data + skip list footer written contiguously
+    // 返回 {offset_in_doc_file, byte_count}
+    // 倒排数据 + 跳表脚注连续写入
     Result<std::pair<uint64_t, uint32_t>> flush(int fd, Arena& scratch);
 
     size_t doc_freq() const { return total_docs_; }
@@ -817,15 +841,15 @@ private:
 class PostingListReader {
 public:
     PostingListReader(const uint8_t* data, size_t len);
-    // data points into mmap'd .doc file
+    // data 指向 mmap'd .doc 文件
 
-    // Iterate all postings. Fn: void(uint32_t doc_id, uint32_t tf)
+    // 迭代所有倒排条目。Fn：void(uint32_t doc_id, uint32_t tf)
     template<typename Fn>
     void for_each(Fn&& fn) const;
 
-    // Advance to the first doc_id >= target.
-    // Returns false if no such doc (exhausted).
-    // Uses skip list to jump over irrelevant blocks.
+    // 前进到第一个 doc_id >= target。
+    // 如果没有这样的文档（已耗尽），返回 false。
+    // 使用跳表跳过不相关的块。
     bool advance_to(uint32_t target, uint32_t& doc_id, uint32_t& tf) const;
 
     size_t doc_freq() const { return total_docs_; }
@@ -837,50 +861,50 @@ private:
     SkipList skip_list_;
     size_t block_count_;
 
-    // Current decode position
+    // 当前解码位置
     uint32_t current_block_;
     const uint8_t* next_block_ptr_;
 };
 ```
 
-### 9.5 Sparse Posting Optimization
+### 9.5 稀疏倒排优化
 
-Terms appearing in > 10% of documents have IDF contribution near zero. For these terms:
+出现在 > 10% 文档中的词条 IDF 贡献接近零。对于这些词条：
 
-- Score computation uses an approximate IDF (precomputed constant), skipping exact doc_freq lookup
-- `advance_to()` supports early termination: if the remaining postings' max possible score contribution is below the current topk heap minimum, stop traversal
-- Flagged in term metadata as SPARSE
+- 分数计算使用近似 IDF（预计算常数），跳过精确 doc_freq 查找
+- `advance_to()` 支持提前终止：如果剩余倒排的最大可能分数贡献低于当前 topk 堆最小值，则停止遍历
+- 在词条元数据中标记为 SPARSE
 
-## 10. Forward Index (.fwd)
+## 10. 前向索引 (.fwd)
 
-### 10.1 Purpose
+### 10.1 目的
 
-The forward index maps `doc_id → (doc_length, field_lengths[])`. BM25F scoring requires `doc_length` and per-field lengths for term frequency normalization. Storing these in the inverted posting list itself would bloat it; a separate dense array is the standard solution.
+前向索引映射 `doc_id → (doc_length, field_lengths[])`。BM25F 评分需要 `doc_length` 和每字段长度用于词频归一化。将这些存储在倒排链本身中会使其臃肿；一个单独的密集数组是标准解决方案。
 
-### 10.2 Binary Format
+### 10.2 二进制格式
 
 ```
-Forward Index File (_N.fwd):
+前向索引文件 (_N.fwd)：
 
-Header (16 bytes):
-  doc_count        : uint32   (number of documents in this segment)
-  field_count      : uint16   (number of indexed TEXT fields)
-  entry_size       : uint16   (bytes per entry, fixed)
-  reserved         : uint64   (padding to 16B alignment)
+头部（16 字节）：
+  doc_count        : uint32   （此段中的文档数）
+  field_count      : uint16   （索引的 TEXT 字段数）
+  entry_size       : uint16   （每个条目字节数，固定）
+  reserved         : uint64   （填充到 16B 对齐）
 
-Body (doc_count × entry_size bytes):
-  For each doc_id (dense, 0..doc_count-1):
-    doc_length      : uint32   (total terms across all fields)
-    field_length[0] : uint32   (term count for field 0)
-    field_length[1] : uint32   (term count for field 1)
+主体（doc_count × entry_size 字节）：
+  对每个 doc_id（密集，0..doc_count-1）：
+    doc_length      : uint32   （所有字段的总词条数）
+    field_length[0] : uint32   （字段 0 的词条数）
+    field_length[1] : uint32   （字段 1 的词条数）
     ...
     field_length[field_count-1] : uint32
 
-Trailer (8 bytes):
-  xxHash64 over [Header + Body]
+尾部（8 字节）：
+  xxHash64 校验 [Header + Body]
 ```
 
-Each entry is `4 + 4 × field_count` bytes. For a typical schema with 3 text fields: 16 bytes per doc. 1M docs = 16 MB per segment — compact enough to mmap entirely.
+每个条目为 `4 + 4 × field_count` 字节。对于典型的 3 个文本字段的 schema：每个文档 16 字节。100 万文档 = 每段 16 MB——足够紧凑以完全 mmap。
 
 ### 10.3 API
 
@@ -889,7 +913,7 @@ class ForwardIndexBuilder {
 public:
     ForwardIndexBuilder(uint16_t field_count);
 
-    // Called once per document, in doc_id order
+    // 每个文档调用一次，按 doc_id 顺序
     void append(uint32_t doc_length, const uint32_t* field_lengths);
 
     Status flush(int fd);
@@ -898,7 +922,7 @@ public:
 
 private:
     uint16_t field_count_;
-    std::vector<uint8_t> buffer_;  // linear buffer, grows to doc_count * entry_size
+    std::vector<uint8_t> buffer_;  // 线性缓冲区，增长到 doc_count * entry_size
     size_t doc_count_ = 0;
 };
 
@@ -909,7 +933,7 @@ public:
 
     struct DocInfo {
         uint32_t doc_length;
-        const uint32_t* field_lengths;  // points into mmap, length = field_count
+        const uint32_t* field_lengths;  // 指向 mmap，长度 = field_count
     };
 
     DocInfo get(uint32_t doc_id) const;
@@ -927,16 +951,16 @@ private:
 };
 ```
 
-## 11. External ID Mapping (.idm)
+## 11. 外部 ID 映射 (.idm)
 
-### 11.1 Problem
+### 11.1 问题
 
-`remove_document(external_id)` must locate which `(segment_id, internal_doc_id)` holds that external ID. Scanning stored fields across all segments is O(total_docs). A dedicated mapping is required.
+`remove_document(external_id)` 必须定位哪个 `(segment_id, internal_doc_id)` 持有该外部 ID。扫描所有段的存储字段是 O(total_docs) 的。需要专用映射。
 
-### 11.2 In-Memory Map
+### 11.2 内存中映射
 
 ```cpp
-// Global mapping maintained by IndexWriter
+// IndexWriter 维护的全局映射
 class ExternalIdMap {
 public:
     struct Location {
@@ -944,57 +968,57 @@ public:
         uint32_t internal_doc_id;
     };
 
-    // Returns nullptr if not found
+    // 如果未找到返回 nullptr
     const Location* find(std::string_view external_id) const;
 
-    // Insert on add_document
+    // 在 add_document 时插入
     void insert(std::string_view external_id, uint64_t seg_id, uint32_t doc_id);
 
-    // Remove on delete
+    // 在删除时移除
     void remove(std::string_view external_id);
 
-    // Save to .idm file during flush (for the active memory segment)
-    Status flush(int fd, Arena& scratch);  // sorted by doc_id
+    // 刷盘时保存到 .idm 文件（用于活跃内存段）
+    Status flush(int fd, Arena& scratch);  // 按 doc_id 排序
 
-    // Load from .idm file
+    // 从 .idm 文件加载
     static Result<std::unique_ptr<ExternalIdMap>> from_file(
         const std::string& path, uint64_t xxhash64_expected);
 
     size_t size() const;
 
 private:
-    // external_id → location in active memory segment or flushed segment
+    // external_id → 活跃内存段或已刷盘段中的位置
     absl::flat_hash_map<std::string, Location> map_;
-    // Also store reverse: for a given segment, doc_id → external_id string
-    // Used when building .idm file (sorted by doc_id)
-    std::vector<std::string> pending_external_ids_;  // indexed by internal_doc_id
+    // 也存储反向：对于给定段，doc_id → external_id 字符串
+    // 用于构建 .idm 文件（按 doc_id 排序）
+    std::vector<std::string> pending_external_ids_;  // 按 internal_doc_id 索引
 };
 ```
 
-### 11.3 .idm File Format
+### 11.3 .idm 文件格式
 
 ```
-_ID Mapping File (_N.idm):
+_ID 映射文件 (_N.idm)：
 
-Header (12 bytes):
+头部（12 字节）：
   doc_count   : uint32
   reserved    : uint64
 
-Body (variable, sorted by internal_doc_id):
-  For each doc_id (0 .. doc_count-1):
+主体（可变，按 internal_doc_id 排序）：
+  对每个 doc_id（0 .. doc_count-1）：
     external_id_len : uint16
-    external_id     : char[external_id_len]  (not null-terminated)
+    external_id     : char[external_id_len]（不以 null 结尾）
 
-Trailer (8 bytes):
-  xxHash64 over [Header + Body]
+尾部（8 字节）：
+  xxHash64 校验 [Header + Body]
 ```
 
-Sizing: assuming average external_id 20 bytes, 1M docs = ~22 MB per segment. Acceptable for an mmap'd file.
+规模估计：假设平均 external_id 20 字节，100 万文档 = 每段约 22 MB。对于 mmap'd 文件是可接受的。
 
-### 11.4 Search Result Resolution
+### 11.4 搜索结果解析
 
 ```cpp
-// In IndexReader::search(), after obtaining topk:
+// 在 IndexReader::search() 中，获取 topk 后：
 for (auto& doc : topk) {
     auto* loc = external_id_map_->resolve(doc.segment_id, doc.internal_doc_id);
     doc.external_id = loc ? std::string(loc->external_id) : "<deleted>";
@@ -1006,15 +1030,15 @@ struct ScoredDoc {
     uint32_t internal_doc_id;
     uint64_t segment_id;
     float score;
-    std::string external_id;   // resolved from .idm
+    std::string external_id;   // 从 .idm 解析
 };
 ```
 
-## 12. Delete Handling
+## 12. 删除处理
 
-### 12.1 Deletion Bitmap
+### 12.1 删除位图
 
-Deletions use Roaring Bitmap (compressed bitset, widely used in search engines):
+删除使用 Roaring Bitmap（压缩位图，广泛用于搜索引擎）：
 
 ```cpp
 class DeleteBitmap {
@@ -1027,74 +1051,74 @@ public:
     size_t total_count() const { return total_; }
     void set_total(uint32_t total);
 
-    // Serialization
-    std::vector<uint8_t> serialize() const;  // Roaring format
+    // 序列化
+    std::vector<uint8_t> serialize() const;  // Roaring 格式
     static DeleteBitmap deserialize(const uint8_t* data, size_t len);
 
 private:
     Roaring roaring_;
-    uint32_t total_ = 0;  // doc_count of this segment
+    uint32_t total_ = 0;  // 此段的 doc_count
 };
 ```
 
-### 12.2 Delete Flow
+### 12.2 删除流程
 
 ```
-remove_document(external_id):
+remove_document(external_id)：
   1. WAL::append_remove(external_id)
   2. Location* loc = external_id_map_.find(external_id)
-  3. If loc->segment_id == active_segment_id:
+  3. 如果 loc->segment_id == active_segment_id：
        memory_segment_.deletes.mark_deleted(loc->internal_doc_id)
-  4. Else:
-       Load _N.del for segment loc->segment_id
+  4. 否则：
+       加载段 loc->segment_id 的 _N.del
        bitmap.mark_deleted(loc->internal_doc_id)
-       Save _N.del
+       保存 _N.del
   5. external_id_map_.remove(external_id)
 
-Query filtering (index_reader.cpp):
-  After collecting candidate doc_ids from posting list intersection/union:
-    for each candidate:
+查询过滤（index_reader.cpp）：
+  从倒排链交集/并集收集候选 doc_id 后：
+    对每个候选：
       segment = segments_[candidate.segment_id]
-      if segment->deletes().is_deleted(candidate.doc_id):
-        continue  // skip deleted doc
+      if segment->deletes().is_deleted(candidate.doc_id)：
+        continue  // 跳过已删除文档
       score = bm25f.score(...)
-      push to heap
+      推入堆
 ```
 
-### 12.3 Delete Lifecycle
+### 12.3 删除生命周期
 
-- Active segment deletes: in-memory bitmap, flushed with segment
-- Flushed segment deletes: persisted to `.del` file, loaded on reader open
-- V2 segment merge: deleted docs are physically removed (not copied to merged segment)
+- 活跃段删除：内存中位图，刷盘时随段写入
+- 已刷盘段删除：持久化到 `.del` 文件，在读取器打开时加载
+- V2 段合并：已删除文档被物理移除（不复制到合并段）
 
-## 13. BM25F Scoring
+## 13. BM25F 评分
 
-### 13.1 Field-Weighted BM25
+### 13.1 字段加权 BM25
 
 ```cpp
 struct FieldBM25Params {
     double k1 = 1.2;
     double b = 0.75;
-    double weight = 1.0;  // relative field weight in final score
+    double weight = 1.0;  // 最终分数中字段的相对权重
 };
 
 struct BM25Params {
-    std::vector<FieldBM25Params> fields;  // indexed by field_index
+    std::vector<FieldBM25Params> fields;  // 按 field_index 索引
 };
 ```
 
-Default: `k1=1.2`, `b=0.75`, `weight=1.0` for all fields. Field weights tuned via `BM25Params`.
+默认：所有字段 `k1=1.2`，`b=0.75`，`weight=1.0`。字段权重通过 `BM25Params` 调整。
 
-### 13.2 Per-Reader Statistics
+### 13.2 每读取器统计
 
-Each IndexReader computes its own aggregate statistics from the SegmentsSnapshot it holds. This is essential for correctness — different readers see different segment sets.
+每个 IndexReader 从其持有的 SegmentsSnapshot 计算自己的聚合统计信息。这对正确性至关重要——不同的读取器看到不同的段集合。
 
 ```cpp
-// IndexReader-local, computed at open() time
+// IndexReader 本地，在 open() 时计算
 struct ReaderStatistics {
     uint64_t total_docs;
-    double avgdl;                         // across all documents
-    std::vector<double> field_avg_lengths; // per-field_index
+    double avgdl;                         // 跨所有文档
+    std::vector<double> field_avg_lengths; // 按 field_index
 };
 ```
 
@@ -1105,19 +1129,19 @@ class Scorer {
 public:
     virtual ~Scorer() = default;
 
-    // Initialize with reader-local aggregate statistics
+    // 使用读取器本地的聚合统计信息初始化
     virtual void init(const ReaderStatistics& stats, const BM25Params& params) = 0;
 
-    // Score a single (term, field) contribution.
-    // tf: term frequency of this term in this field
-    // doc_freq: total number of docs containing this term (from TermDict)
-    // field_length: this document's field length (from .fwd)
-    // field_index: which field this score is for
+    // 对单个 (term, field) 贡献评分。
+    // tf：该词条在此字段中的词频
+    // doc_freq：包含该词条的文档总数（来自 TermDict）
+    // field_length：此文档的字段长度（来自 .fwd）
+    // field_index：此分数对应的字段
     virtual double term_score(uint32_t tf, uint32_t doc_freq,
                               uint32_t field_length,
                               uint8_t field_index) const = 0;
 
-    // Combine per-term scores for a document into final score
+    // 将文档的每个词条分数合并为最终分数
     virtual double combine(absl::Span<const double> term_scores) const = 0;
 
     virtual double field_weight(uint8_t field_index) const = 0;
@@ -1132,7 +1156,7 @@ public:
                       uint8_t field_index) const override;
 
     double combine(absl::Span<const double> term_scores) const override {
-        // Sum of weighted term scores
+        // 加权词条分数之和
         double total = 0.0;
         for (auto s : term_scores) total += s;
         return total;
@@ -1156,7 +1180,7 @@ private:
 };
 ```
 
-BM25F formula per term per field:
+BM25F 每个词条每个字段的公式：
 
 ```
 score(term, doc, field) = weight[field]
@@ -1165,28 +1189,28 @@ score(term, doc, field) = weight[field]
   / (tf + k1 × (1 - b + b × field_length / field_avg_length))
 ```
 
-## 14. WAL (Write-Ahead Log)
+## 14. WAL（预写日志）
 
-### 14.1 Binary Format
+### 14.1 二进制格式
 
 ```
-WAL Record:
+WAL 记录：
 ┌──────────┬──────────┬──────────┬───────────┬───────────┬──────────┐
 │ CRC32    │ op_type  │ body_len │ id_len    │ external  │ payload  │
 │ (4B)     │ (1B)     │ (4B)     │ (2B)      │ _id       │ (var)    │
 └──────────┴──────────┴──────────┴───────────┴───────────┴──────────┘
 
-op_type: 0x01 = ADD, 0x02 = REMOVE
+op_type：0x01 = ADD，0x02 = REMOVE
 
-ADD payload:
+ADD 负载：
   field_count : uint16
-  For each field:
+  对每个字段：
     name_len   : uint16
     name       : char[name_len]
     value_len  : uint32
     value      : char[value_len]
 
-REMOVE: no payload (external_id in header is sufficient)
+REMOVE：无负载（头部中的 external_id 足够）
 ```
 
 ### 14.2 API
@@ -1200,22 +1224,22 @@ public:
                        const Document& doc);
     Status append_remove(std::string_view external_id);
 
-    // Force fsync (called on group commit timer or threshold)
+    // 强制 fsync（在组提交计时器或阈值时调用）
     Status sync();
 
-    // Truncate after successful flush
+    // 成功刷盘后截断
     Status truncate();
 
-    // Crash recovery: replay all records since last truncation
+    // 崩溃恢复：回放自上次截断以来的所有记录
     struct RecoveryState {
         uint32_t next_internal_id;
-        // map: internal_id → (external_id, Document)
+        // 映射：internal_id → (external_id, Document)
         absl::flat_hash_map<uint32_t, std::pair<std::string, Document>> active_docs;
         absl::flat_hash_set<std::string> removed_ids;
     };
     Result<RecoveryState> recover(const Schema& schema);
 
-    // Statistics
+    // 统计信息
     uint64_t bytes_written() const;
     uint32_t record_count() const;
 
@@ -1229,50 +1253,50 @@ private:
 };
 ```
 
-### 14.3 Group Commit
+### 14.3 组提交
 
 ```
-append():
-  1. Serialize record to write_buf_
-  2. If write_buf_.size() >= kMaxBufferSize OR
-        time_since_last_sync >= kMaxSyncIntervalMs:
+append()：
+  1. 将记录序列化到 write_buf_
+  2. 如果 write_buf_.size() >= kMaxBufferSize 或
+        time_since_last_sync >= kMaxSyncIntervalMs：
        → write(fd_, write_buf_)
        → fdatasync(fd_)
        → write_buf_.clear()
        → last_sync_ = now
 ```
 
-### 14.4 Recovery Protocol
+### 14.4 恢复协议
 
 ```
-recover():
-  1. If wal.log doesn't exist or is empty → return empty state
-  2. Validate each record's CRC32 sequentially
-  3. If CRC32 mismatch → truncate at last valid record, log warning
-  4. Replay: apply ADD/REMOVE records to in-memory state
-  5. Return RecoveryState
+recover()：
+  1. 如果 wal.log 不存在或为空 → 返回空状态
+  2. 顺序验证每条记录的 CRC32
+  3. 如果 CRC32 不匹配 → 在最后一个有效记录处截断，记录警告
+  4. 回放：将 ADD/REMOVE 记录应用到内存状态
+  5. 返回 RecoveryState
 
-On IndexWriter::open():
-  1. Read segments.manifest → load committed segments
-  2. Delete any *.tmp files (partial flush from crash)
-  3. Call WAL::recover() → rebuild memory segment state
-  4. Set next_internal_id = recovery.next_internal_id
-  5. WAL::truncate()  // WAL replayed, safe to start fresh
+在 IndexWriter::open() 中：
+  1. 读取 segments.manifest → 加载已提交的段
+  2. 删除所有 *.tmp 文件（崩溃导致的部分刷盘）
+  3. 调用 WAL::recover() → 重建内存段状态
+  4. 设置 next_internal_id = recovery.next_internal_id
+  5. WAL::truncate()  // WAL 已回放，安全地重新开始
 ```
 
-## 15. Data Integrity
+## 15. 数据完整性
 
-### 15.1 File Trailer
+### 15.1 文件尾部
 
-Every data file (.fst, .doc, .store, .fwd, .idm) ends with:
+每个数据文件（.fst, .doc, .store, .fwd, .idm）末尾带有：
 
 ```
 ┌────────────────────┬────────────────┐
-│  File Body         │  xxHash64 (8B) │
+│  文件主体          │  xxHash64 (8B) │
 └────────────────────┴────────────────┘
 ```
 
-Validation on load:
+加载时验证：
 ```cpp
 Result<std::unique_ptr<MmapHandle>> open_and_verify(const std::string& path) {
     int fd = open(path.c_str(), O_RDONLY);
@@ -1294,28 +1318,28 @@ Result<std::unique_ptr<MmapHandle>> open_and_verify(const std::string& path) {
 }
 ```
 
-### 15.2 Manifest as Source of Truth
+### 15.2 Manifest 作为真相源
 
-`segments.manifest` is the authoritative list of committed segments. Crash recovery cleans any file not referenced by the manifest (or a .tmp file).
+`segments.manifest` 是已提交段的权威列表。崩溃恢复清理任何未被 manifest 引用的文件（或 .tmp 文件）。
 
-## 16. File Organization
+## 16. 文件组织
 
 ```
 index_dir/
-├── wal.log                ← binary WAL (recreated on each open)
-├── segments.manifest      ← authoritative segment list + checksums (JSON)
-├── _0.fst                 ← Segment 0 FST dictionary
-├── _0.doc                 ← Segment 0 posting data
-├── _0.store               ← Segment 0 document store
-├── _0.fwd                 ← Segment 0 forward index
-├── _0.idm                 ← Segment 0 external ID mapping
-├── _0.meta                ← Segment 0 metadata
-├── _0.del                 ← Segment 0 deletion bitmap
+├── wal.log              ← 二进制 WAL（每次打开时重新创建）
+├── segments.manifest    ← 权威段列表 + 校验和（JSON）
+├── _0.fst               ← Segment 0 FST 词典
+├── _0.doc               ← Segment 0 倒排数据
+├── _0.store             ← Segment 0 文档存储
+├── _0.fwd               ← Segment 0 前向索引
+├── _0.idm               ← Segment 0 外部 ID 映射
+├── _0.meta              ← Segment 0 元数据
+├── _0.del               ← Segment 0 删除位图
 ├── _1.fst / _1.doc / ...
 └── ...
 ```
 
-Temporary files (during flush): `_N.*.tmp` — cleaned on crash recovery.
+临时文件（刷盘期间）：`_N.*.tmp` — 崩溃恢复时清理。
 
 ### 16.1 segments.manifest
 
@@ -1341,7 +1365,7 @@ Temporary files (during flush): `_N.*.tmp` — cleaned on crash recovery.
 }
 ```
 
-### 16.2 Segment Metadata (_N.meta)
+### 16.2 段元数据 (_N.meta)
 
 ```json
 {
@@ -1363,74 +1387,74 @@ Temporary files (during flush): `_N.*.tmp` — cleaned on crash recovery.
 }
 ```
 
-## 17. AND / OR Intersection Algorithms
+## 17. AND / OR 交集算法
 
 ### 17.1 AND
 
 ```
-intersect(readers, topk, scorer, fwd_index, del_bitmaps):
-  1. Sort readers by doc_freq ascending (shortest first)
-  2. driver = readers[0]; others = readers[1..]
+intersect(readers, topk, scorer, fwd_index, del_bitmaps)：
+  1. 按 doc_freq 升序排序读取器（最短优先）
+  2. driver = readers[0]；others = readers[1..]
 
-  3. For each posting in driver:
+  3. 对 driver 中的每个倒排条目：
        doc_id = posting.doc_id
 
-       // Check deletion
-       if del_bitmaps.is_deleted(doc_id): continue
+       // 检查删除
+       if del_bitmaps.is_deleted(doc_id)：continue
 
-       // Try to find doc_id in all other readers
+       // 尝试在所有其他读取器中查找 doc_id
        found = true
        all_tfs = [driver.tf]
-       for each r in others:
-         if !r.advance_to(doc_id, matched_doc, matched_tf):
-           found = false; break
+       for each r in others：
+         if !r.advance_to(doc_id, matched_doc, matched_tf)：
+           found = false；break
          all_tfs.append(matched_tf)
 
-       if found:
-         // Look up document info from forward index
+       if found：
+         // 从前向索引查找文档信息
          doc_info = fwd_index.get(doc_id)
-         // Compute BM25F across all field hits
+         // 跨所有字段命中计算 BM25F
          score = scorer.combine(scorer.term_score(all_tfs[i], ...))
-         if heap.size() < topk or score > heap.min():
+         if heap.size() < topk or score > heap.min()：
            heap.push({doc_id, score})
 
-  4. Optional early termination:
+  4. 可选的提前终止：
        max_remaining_score = scorer.max_possible_term_contribution(driver.next_doc_id)
-       if heap.size() == topk and heap.min() > max_remaining_score:
+       if heap.size() == topk and heap.min() > max_remaining_score：
          break
 ```
 
 ### 17.2 OR
 
 ```
-union_merge(readers, topk, scorer, fwd_index, del_bitmaps):
-  1. Min-heap of (reader_idx, doc_id, tf)
-  2. While heap not empty:
-       // Pop all entries with same doc_id
+union_merge(readers, topk, scorer, fwd_index, del_bitmaps)：
+  1. 最小堆（reader_idx, doc_id, tf）
+  2. 当堆不为空时：
+       // 弹出具有相同 doc_id 的所有条目
        doc_id = heap.min().doc_id
        all_tfs = []
-       while heap.min().doc_id == doc_id:
+       while heap.min().doc_id == doc_id：
          entry = heap.pop()
          all_tfs.append({entry.reader_idx, entry.tf})
-         advance entry.reader; if not exhausted: heap.push
+         前进 entry.reader；如果未耗尽：推入堆
 
-       // Check deletion
-       if del_bitmaps.is_deleted(doc_id): continue
+       // 检查删除
+       if del_bitmaps.is_deleted(doc_id)：continue
 
-       // Score
+       // 评分
        doc_info = fwd_index.get(doc_id)
        score = scorer.combine(...)
-       push topk_heap
+       推入 topk_heap
 
-  3. Early termination: same as AND
+  3. 提前终止：与 AND 相同
 ```
 
-## 18. Observability
+## 18. 可观测性
 
-Baked in from day one. No after-the-fact instrumentation.
+从第一天起就内置。不是事后添加的仪表化。
 
 ```cpp
-// Thread-safe counters using std::atomic
+// 使用 std::atomic 的线程安全计数器
 struct AtomicCounter {
     void inc() { val_.fetch_add(1, std::memory_order_relaxed); }
     void add(uint64_t n) { val_.fetch_add(n, std::memory_order_relaxed); }
@@ -1439,7 +1463,7 @@ private:
     std::atomic<uint64_t> val_{0};
 };
 
-// Fixed-bucket integer histogram, no allocation after construction
+// 固定桶整数直方图，构造后无分配
 class Histogram {
 public:
     Histogram(std::vector<uint64_t> bucket_upper_bounds_us);
@@ -1461,18 +1485,18 @@ private:
 };
 
 struct IndexStats {
-    // Index state
+    // 索引状态
     AtomicCounter total_docs;
     AtomicCounter total_terms;
     AtomicCounter segment_count;
-    AtomicCounter memory_bytes;      // active arena usage
-    AtomicCounter disk_bytes;        // sum of all segment file sizes
+    AtomicCounter memory_bytes;      // 活跃 arena 使用量
+    AtomicCounter disk_bytes;        // 所有段文件大小之和
 
     // WAL
     AtomicCounter wal_bytes;
     AtomicCounter wal_syncs;
 
-    // Write throughput
+    // 写入吞吐量
     AtomicCounter docs_added;
     AtomicCounter docs_removed;
     AtomicCounter flushes;
@@ -1489,20 +1513,20 @@ struct QueryStats {
 };
 ```
 
-## 19. Query Model
+## 19. 查询模型
 
 ```cpp
 enum class QueryType : uint8_t {
     TERM,
     AND,
     OR,
-    NOT,   // NOT queries run as AND minus the negated sub-query
+    NOT,   // NOT 查询作为 AND 减去否定子查询运行
 };
 
 struct Query {
     QueryType type;
-    std::string term;               // only for TERM
-    std::vector<Query> sub_queries; // for AND / OR / NOT
+    std::string term;               // 仅用于 TERM
+    std::vector<Query> sub_queries; // 用于 AND / OR / NOT
 
     static Query Term(std::string t) {
         return {QueryType::TERM, std::move(t), {}};
@@ -1520,20 +1544,20 @@ struct Query {
 
 struct ScoredDoc {
     float score;
-    std::string external_id;     // resolved from .idm
-    // internal fields for debugging
+    std::string external_id;     // 从 .idm 解析
+    // 调试用的内部字段
     uint64_t segment_id;
     uint32_t internal_doc_id;
 };
 
 struct SearchResult {
     std::vector<ScoredDoc> docs;
-    uint64_t total_hits;         // total matching docs (for pagination)
+    uint64_t total_hits;         // 匹配的文档总数（用于分页）
     uint64_t elapsed_us;
 };
 ```
 
-## 20. API Entry
+## 20. API 入口
 
 ```cpp
 namespace vortex {
@@ -1541,54 +1565,54 @@ namespace vortex {
 struct IndexWriterOptions {
     std::string index_dir;
     Schema schema;
-    uint32_t ram_buffer_mb = 64;     // flush threshold
+    uint32_t ram_buffer_mb = 64;     // 刷盘阈值
     uint32_t wal_sync_interval_ms = 10;
     BM25Params bm25_params;
 
-    // External ID field name (KEYWORD stored field, required)
+    // 外部 ID 字段名（KEYWORD 存储字段，必需）
     std::string external_id_field = "doc_id";
 };
 
-// Open or create an index
+// 打开或创建索引
 Result<std::unique_ptr<IndexWriter>> IndexWriter::open(IndexWriterOptions opts);
 
-// ── Write API ──
+// ── 写入 API ──
 
-// Add a document. Returns Status; document is crash-safe after return.
+// 添加文档。返回 Status；文档在返回后是崩溃安全的。
 Status IndexWriter::add_document(const Document& doc);
 
-// Remove by external ID.
+// 按外部 ID 删除。
 Status IndexWriter::remove_document(std::string_view external_id);
 
-// Atomic remove-then-add.
+// 原子删除后添加。
 Status IndexWriter::update_document(std::string_view external_id,
                                      const Document& new_doc);
 
-// Force flush of the in-memory segment to disk.
+// 强制将内存段刷入磁盘。
 Status IndexWriter::flush();
 
-// Get a point-in-time reader.
+// 获取时间点读取器。
 Result<std::shared_ptr<IndexReader>> IndexWriter::get_reader();
 
-// Statistics.
+// 统计信息。
 const IndexStats& IndexWriter::stats() const;
 
-// ── Read API ──
+// ── 读取 API ──
 
-// Search with boolean query, return topk results.
+// 使用布尔查询搜索，返回 topk 结果。
 Result<SearchResult> IndexReader::search(const Query& query, size_t topk = 10);
 
-// Get a single document by external ID (stored field lookup).
+// 按外部 ID 获取单个文档（存储字段查找）。
 Result<std::optional<Document>> IndexReader::get_document(
     std::string_view external_id);
 
-// Statistics.
+// 统计信息。
 const QueryStats& IndexReader::stats() const;
 
 }  // namespace vortex
 ```
 
-## 21. Code Directory
+## 21. 代码目录
 
 ```
 include/vortex/core/
@@ -1599,22 +1623,22 @@ include/vortex/core/
 ├── query.h              // Query, QueryType
 ├── search_result.h      // ScoredDoc, SearchResult
 ├── stats.h              // IndexStats, QueryStats, Histogram, AtomicCounter
-├── checksum.h           // xxHash64 wrapper
-└── types.h              // u32, u64, etc.
+├── checksum.h           // xxHash64 包装器
+└── types.h              // u32, u64 等
 
 include/vortex/inverted/
 ├── index_writer.h       // IndexWriter, IndexWriterOptions
 ├── index_reader.h       // IndexReader
-├── segment.h            // Segment (immutable, disk-backed), MemorySegment (mutable)
+├── segment.h            // Segment（不可变，磁盘后端），MemorySegment（可变）
 ├── segment_list.h       // SegmentList, SegmentsSnapshot (RCU)
 ├── term_dict.h          // TermDict, TermDictBuilder, TermInfo
-├── posting_codec.h      // SIMD-BP128 codec, runtime dispatch declarations
+├── posting_codec.h      // SIMD-BP128 编解码器，运行时调度声明
 ├── posting_list.h       // PostingListBuilder, PostingListReader
 ├── skip_list.h          // SkipList
 ├── forward_index.h      // ForwardIndex, ForwardIndexBuilder, DocInfo
-├── external_id_map.h    // ExternalIdMap, IdMapping (per-segment .idm)
-├── delete_bitmap.h      // DeleteBitmap (Roaring Bitmap wrapper)
-├── scorer.h             // Scorer (interface), BM25FScorer
+├── external_id_map.h    // ExternalIdMap, IdMapping（每段 .idm）
+├── delete_bitmap.h      // DeleteBitmap（Roaring Bitmap 包装器）
+├── scorer.h             // Scorer（接口），BM25FScorer
 ├── analyzer.h           // Analyzer
 ├── tokenizer.h          // Tokenizer, StandardTokenizer, CJKBigramTokenizer,
                          // MixedTokenizer, TokenConsumer
@@ -1628,10 +1652,10 @@ src/inverted/
 ├── segment.cpp
 ├── segment_list.cpp
 ├── term_dict.cpp
-├── term_dict_builder.cpp    // FST incremental minimization
-├── posting_codec.cpp        // SSE4.2 baseline
-├── posting_codec_avx2.cpp   // AVX2 accelerated (compiled with -mavx2)
-├── posting_codec_dispatch.cpp // runtime dispatch setup
+├── term_dict_builder.cpp    // FST 增量最小化
+├── posting_codec.cpp        // SSE4.2 基准
+├── posting_codec_avx2.cpp   // AVX2 加速（用 -mavx2 编译）
+├── posting_codec_dispatch.cpp // 运行时调度设置
 ├── posting_list.cpp
 ├── skip_list.cpp
 ├── forward_index.cpp
@@ -1645,27 +1669,27 @@ src/inverted/
 └── unicode.cpp
 ```
 
-## 22. Build & CI Requirements
+## 22. 构建与 CI 要求
 
-### 22.1 Compiler Policy
+### 22.1 编译器策略
 
 ```
-Minimum:      GCC 13+, Clang 18+
-Recommended:  GCC 14+, Clang 20+
-SIMD baseline: SSE4.2 (x86-64 mandatory)
-SIMD optional: AVX2 (runtime dispatch, separate compilation unit)
+最低要求：     GCC 13+, Clang 18+
+推荐：         GCC 14+, Clang 20+
+SIMD 基准：    SSE4.2（x86-64 强制）
+SIMD 可选：    AVX2（运行时调度，独立编译单元）
 ```
 
-### 22.2 CMake Configuration
+### 22.2 CMake 配置
 
 ```cmake
-# Strict warnings
+# 严格警告
 target_compile_options(vortex PRIVATE
     -Wall -Wextra -Wpedantic -Werror
     -Wno-unused-parameter
 )
 
-# Compile posting_codec_avx2.cpp with AVX2
+# 使用 AVX2 编译 posting_codec_avx2.cpp
 if(VORTEX_USE_AVX2)
     set_source_files_properties(
         src/inverted/posting_codec_avx2.cpp
@@ -1673,66 +1697,64 @@ if(VORTEX_USE_AVX2)
     )
 endif()
 
-# Sanitizer builds
+# 消毒器构建
 option(VORTEX_ASAN ON)
 option(VORTEX_UBSAN ON)
 
-# Optional ICU
+# 可选的 ICU
 option(VORTEX_USE_ICU OFF)
 
-# Link dependencies
-# absl::flat_hash_map, absl::InlinedVector
-find_package(absl REQUIRED)
-target_link_libraries(vortex PUBLIC absl::flat_hash_map absl::inlined_vector)
-
+# 链接依赖
+# 实际实现使用 std:: 容器替代了设计中的 absl（flat_hash_map → std::unordered_map,
+# InlinedVector → std::vector, Span → std::span），降低外部依赖。
 # Roaring Bitmap
 include(FetchContent)
 FetchContent_Declare(roaring GIT_REPOSITORY ... GIT_TAG v4.0.0)
-target_link_libraries(vortex PRIVATE roaring)
+target_link_libraries(vortex PUBLIC roaring)
 ```
 
-### 22.3 CI Matrix
+### 22.3 CI 矩阵
 
 ```
-Matrix:
-  compiler:  [gcc-13, gcc-14, clang-18, clang-20]
-  build_type: [Debug, Release, ASan+UBSan]
+矩阵：
+  compiler：   [gcc-13, gcc-14, clang-18, clang-20]
+  build_type： [Debug, Release, ASan+UBSan]
 
-Jobs per matrix cell:
+每个矩阵单元的任务：
   1. cmake -B build -DCMAKE_BUILD_TYPE=$TYPE -DVORTEX_BUILD_TESTS=ON
   2. cmake --build build -j$(nproc)
   3. cd build && ctest --output-on-failure -j$(nproc)
 
-Standalone jobs:
-  - clang-tidy (strict, no warnings allowed)
+独立任务：
+  - clang-tidy（严格，不允许警告）
   - clang-format --dry-run -Werror
-  - Coverage (Debug + coverage flags → lcov → > 85% line coverage)
-  - Benchmark (Release → run benchmarks, compare with previous results)
+  - 覆盖率（Debug + 覆盖率标志 → lcov → > 85% 行覆盖率）
+  - 基准测试（Release → 运行基准测试，与之前结果比较）
 
-Pre-commit hooks:
-  - clang-format on staged files
-  - clang-tidy on staged files (changed lines only)
+预提交钩子：
+  - 对暂存文件运行 clang-format
+  - 对暂存文件运行 clang-tidy（仅更改的行）
 ```
 
-## 23. Implementation Order
+## 23. 实现顺序
 
-| Phase | Content | Files | Deps | Est. |
-|-------|---------|-------|------|------|
-| 0 | Infrastructure: Status, Arena, Checksum, Stats, Types | core/*.h | — | 2d |
+| 阶段 | 内容 | 文件 | 依赖 | 估算 |
+|------|------|------|------|------|
+| 0 | 基础设施：Status, Arena, Checksum, Stats, Types | core/*.h | — | 2d |
 | 1 | Unicode + Analyzer + Tokenizer + Filters | unicode, analyzer, tokenizer, filter | 0 | 3d |
 | 2 | Posting Codec (SSE4.2 baseline + AVX2) + SkipList | posting_codec*, skip_list | 0 | 3d |
-| 3 | FST dictionary build + query | term_dict* | 0 | 5d |
+| 3 | FST 字典构建 + 查询 | term_dict* | 0 | 5d |
 | 4 | ForwardIndex + ExternalIdMap + DeleteBitmap | forward_index, external_id_map, delete_bitmap | 0 | 3d |
-| 5 | Segment (memory + disk, atomic flush, mmap) | segment | 3, 4 | 4d |
+| 5 | Segment（内存 + 磁盘，原子刷盘，mmap） | segment | 3, 4 | 4d |
 | 6 | BM25F Scorer | scorer | 4 | 2d |
-| 7 | WAL (binary + group commit + recovery) | wal | 1 | 2d |
-| 8 | SegmentList (RCU) | segment_list | 5 | 2d |
-| 9 | IndexWriter + IndexReader integration | index_writer, index_reader | 5, 6, 7, 8 | 3d |
-| 10 | Unit tests (per module, parallel with above) | tests/ | per-phase | ongoing |
-| 11 | Benchmark + perf tuning | benchmarks/ | 9 | 3d |
-| 12 | CI/CD pipeline | .github/ | — | 1d |
+| 7 | WAL（二进制 + 组提交 + 恢复） | wal | 1 | 2d |
+| 8 | SegmentList（RCU） | segment_list | 5 | 2d |
+| 9 | IndexWriter + IndexReader 集成 | index_writer, index_reader | 5, 6, 7, 8 | 3d |
+| 10 | 单元测试（每个模块，与上述并行） | tests/ | 每阶段 | ongoing |
+| 11 | 基准测试 + 性能调优 | benchmarks/ | 9 | 3d |
+| 12 | CI/CD 流水线 | .github/ | — | 1d |
 
-Phase dependency graph:
+阶段依赖图：
 ```
 0 ──→ 1 ──→ 7
   ──→ 2 ──→ 5 ──→ 9
@@ -1741,24 +1763,24 @@ Phase dependency graph:
                8 ──→ 9
 ```
 
-Phases 1/2/3/4 are parallelizable. Phase 5 is the first integration point. Phase 9 is the final integration.
+阶段 1/2/3/4 可并行。阶段 5 是第一个集成点。阶段 9 是最终集成。
 
-## 24. Design Principles
+## 24. 设计原则
 
-1. **Data structures define the performance ceiling.** FST, SIMD-BP128, SkipList, Roaring — each choice is validated by industry benchmarks. No "fix it later" data structures.
+1. **数据结构决定性能上限。** FST、SIMD-BP128、SkipList、Roaring——每个选择都经过行业基准验证。没有"以后再修"的数据结构。
 
-2. **Allocation is explicit and controllable.** Arena hierarchy ensures no malloc in hot paths. Memory budget is predictable.
+2. **分配是显式且可控的。** Arena 层次结构确保热路径中没有 malloc。内存预算可预测。
 
-3. **Zero-copy reads.** mmap + FST direct mapping. Query path never copies posting data into intermediate buffers.
+3. **零拷贝读取。** mmap + FST 直接映射。查询路径从不将倒排数据复制到中间缓冲区。
 
-4. **Data safety by default.** Every file carries a checksum. Crash recovery is validated end-to-end. Atomic flush (tmp → rename) prevents partial writes from corrupting committed state.
+4. **默认数据安全。** 每个文件都带有校验和。崩溃恢复经过端到端验证。原子刷盘（tmp → 重命名）防止部分写入损坏已提交状态。
 
-5. **Observable from day one.** Histograms, counters, and statistics are built into the first commit, not retrofitted.
+5. **从第一天起可观测。** 直方图、计数器和统计信息内置于第一次提交，而非事后添加。
 
-6. **API returns errors, never throws.** `Status` / `Result<T>` at every boundary. Only logic bugs trigger PANIC.
+6. **API 返回错误，从不抛出。** 每个边界的 `Status` / `Result<T>`。只有逻辑 bug 触发 PANIC。
 
-7. **Runtime dispatch for SIMD.** One binary for all x86-64 CPUs. Optimal path chosen at init based on CPU capabilities.
+7. **SIMD 运行时调度。** 适用于所有 x86-64 CPU 的单一二进制文件。在初始化时根据 CPU 能力选择最优路径。
 
-8. **Delete handling is a first-class concern.** External ID mapping enables O(1) delete lookup. `.del` bitmaps integrate with the query path from day one.
+8. **删除处理是一等关注点。** 外部 ID 映射实现 O(1) 删除查找。`.del` 位图从第一天起就集成到查询路径中。
 
-9. **Single writer, multiple readers.** Matching the industry standard model (Lucene, Tantivy). Multi-writer scenarios use external sharding.
+9. **单写入器，多读取器。** 符合行业标准模型（Lucene、Tantivy）。多写入器场景使用外部分片。

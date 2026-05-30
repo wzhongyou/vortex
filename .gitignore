@@ -1,5 +1,5 @@
 # Build
-build/
+build*/
 cmake-build-*/
 out/
 
@@ -10,12 +10,8 @@ out/
 *.swo
 .DS_Store
 
-# Research docs (local only)
-research/
-
 # Localized docs (not committed)
 docs/*_zh.md
-README_zh.md
 
 # Dependencies
 third_party/

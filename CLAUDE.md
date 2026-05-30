@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-Vortex — a C++17 multi-recall engine supporting inverted index, vector index, and pluggable index backends, with result fusion. MIT licensed.
+Vortex — a C++17 inverted index (full-text search) engine. MIT licensed.
 
 ## Build Commands
 
@@ -13,11 +13,11 @@ Vortex — a C++17 multi-recall engine supporting inverted index, vector index, 
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 
 # Build
-cmake --build build -j$(nproc)
+cmake --build build -j$(sysctl -n hw.ncpu)
 
 # Debug build with tests
 cmake -B build -DCMAKE_BUILD_TYPE=Debug -DVORTEX_BUILD_TESTS=ON
-cmake --build build -j$(nproc)
+cmake --build build -j$(sysctl -n hw.ncpu)
 
 # Run tests
 cd build && ctest --output-on-failure
@@ -32,13 +32,11 @@ cd build && ./benchmarks/vortex_benchmarks
 ## Directory layout
 
 ```
-include/vortex/core/     # Index, Document, Result, Field
-include/vortex/inverted/ # InvertedIndex, Analyzer, PostingList, Scorer
-include/vortex/vector/   # VectorIndex, HNSW, Distance
-include/vortex/engine/   # RecallEngine, Fusion
-include/vortex/store/    # DocStore
+include/vortex/core/     # Arena, Document, Query, Schema, Stats, Status, Types
+include/vortex/inverted/ # Analyzer, FST Dict, PostingList, BM25F, Segment, WAL
 src/                     # Implementation (mirrors include/)
 tests/                   # GoogleTest unit tests
+examples/                # Usage example
 benchmarks/              # Google Benchmark micro-benchmarks
 ```
 
@@ -47,7 +45,7 @@ benchmarks/              # Google Benchmark micro-benchmarks
 - C++17, CMake 3.16+
 - Header-only where feasible for template-heavy code; `.cpp` for non-template logic
 - GoogleTest for tests, Google Benchmark for perf
-- FlatBuffers for on-disk serialization
+- Custom binary format for on-disk serialization (no FlatBuffers)
 - Namespace: `vortex::`
 - Include guard style: `#pragma once`
 

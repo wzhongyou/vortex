@@ -95,3 +95,7 @@ if(VORTEX_BUILD_BENCHMARKS)
     FetchContent_MakeAvailable(googlebenchmark)
     add_subdirectory(benchmarks)
 endif()
+
+if(VORTEX_BUILD_EXAMPLES)
+    add_subdirectory(examples)
+endif()

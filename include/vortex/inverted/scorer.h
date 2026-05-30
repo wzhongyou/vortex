@@ -11,17 +11,29 @@ struct BM25Params {
     double b = 0.75;
 };
 
-class BM25FScorer {
+// Abstract base class for scoring.
+class Scorer {
+public:
+    virtual ~Scorer() = default;
+
+    // Score a single term in a single field.
+    virtual double score(uint32_t tf, uint32_t doc_freq, uint32_t field_length) const = 0;
+
+    // Combine term scores for a document.
+    virtual double combine(const std::vector<double>& term_scores) const = 0;
+
+    virtual double idf(uint32_t doc_freq) const = 0;
+};
+
+class BM25FScorer final : public Scorer {
 public:
     BM25FScorer(const BM25Params& params, uint64_t total_docs, double avgdl);
 
-    // Score a single term in a single field.
-    double score(uint32_t tf, uint32_t doc_freq, uint32_t field_length) const;
+    double score(uint32_t tf, uint32_t doc_freq, uint32_t field_length) const override;
 
-    // Combine term scores for a document.
-    double combine(const std::vector<double>& term_scores) const;
+    double combine(const std::vector<double>& term_scores) const override;
 
-    double idf(uint32_t doc_freq) const;
+    double idf(uint32_t doc_freq) const override;
 
 private:
     BM25Params params_;

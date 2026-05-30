@@ -11,7 +11,7 @@
 namespace vortex {
 
 struct SegmentsSnapshot;
-class BM25FScorer;
+class Scorer;
 
 class IndexReader {
 public:
@@ -26,7 +26,7 @@ public:
 private:
     SegmentsSnapshot* snapshot_;
     SegmentList* segment_list_;
-    std::unique_ptr<BM25FScorer> scorer_;
+    std::unique_ptr<Scorer> scorer_;
     mutable QueryStats stats_;
 };
 

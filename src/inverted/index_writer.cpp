@@ -82,6 +82,7 @@ Status IndexWriter::add_document(const Document& doc) {
 
     // External ID mapping
     id_map_->insert(external_id, active_segment_->segment_id(), internal_id);
+    active_segment_->add_external_id(external_id);
 
     // Tokenize indexed TEXT fields, aggregating term frequencies per document.
     uint32_t total_doc_length = 0;
