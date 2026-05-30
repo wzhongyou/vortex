@@ -1,35 +1,35 @@
-# Contributing to Vortex
+# 贡献指南
 
-Thanks for your interest! Vortex is an active C++17 inverted index engine.
+感谢你的关注！Vortex 是一个活跃维护的 C++17 倒排索引引擎。
 
-## How to Contribute
+## 如何贡献
 
-- **Bug reports / feature requests** — open GitHub Issues
-- **Code** — fork the repo, develop on a feature branch, submit PRs to `main`
-- **Documentation** — improvements and translations are welcome
+- **报告 Bug / 提需求** — 提交 GitHub Issue
+- **代码** — Fork 仓库，在功能分支开发，PR 提交到 `main`
+- **文档** — 欢迎改进和翻译
 
-## Development Environment
+## 开发环境
 
-- C++17 compiler (GCC 9+ / Clang 10+ / Apple Clang 14+)
+- C++17 编译器（GCC 9+ / Clang 10+ / Apple Clang 14+）
 - CMake 3.16+
 
 ```bash
-# Configure and build
+# 配置和构建
 cmake -B build -DCMAKE_BUILD_TYPE=Debug -DVORTEX_BUILD_TESTS=ON
 cmake --build build -j$(sysctl -n hw.ncpu)
 
-# Run tests
+# 运行测试
 cd build && ctest --output-on-failure
 ```
 
-## Code Style
+## 代码风格
 
-- C++17 standard
-- `#pragma once` header guards
-- `vortex::` namespace
-- Header-only for template-heavy code; `.cpp` for non-template logic
-- Commit messages in English
+- C++17 标准
+- `#pragma once` 头文件防护
+- `vortex::` 命名空间
+- 模板密集代码优先头文件，非模板逻辑放 `.cpp`
+- 提交信息用英文
 
-## License
+## 协议
 
-MIT — all contributions are licensed under this agreement.
+MIT — 所有贡献均按此协议授权。
