@@ -55,9 +55,10 @@ int main(int argc, char** argv) {
     auto reader = writer->get_reader().move_value();
     auto print = [&](const std::string& label, Query q) {
         auto r = reader->search(q, 10).move_value();
-        printf("── %s ── hits=%zu\n", label.c_str(), r.total_hits);
+        printf("── %s ── hits=%llu\n", label.c_str(), (unsigned long long)r.total_hits);
         for (auto& d : r.docs)
-            printf("  [%s] score=%.2f seg=%u doc_id=%u\n", d.external_id.c_str(), d.score, d.segment_id, d.internal_doc_id);
+            printf("  [%s] score=%.2f seg=%llu doc_id=%u\n", d.external_id.c_str(), d.score,
+                   (unsigned long long)d.segment_id, d.internal_doc_id);
         printf("\n");
     };
 
