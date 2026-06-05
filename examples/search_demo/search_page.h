@@ -30,7 +30,8 @@ body{font-family:arial,sans-serif;background:#fff;color:#202124;min-height:100vh
 
 /* ── Results Page (搜索结果页) ─────────────────────── */
 #results-page{display:none;min-height:100vh}
-.top-bar{position:sticky;top:0;background:#fff;padding:12px 24px;display:flex;align-items:center;gap:20px;z-index:100}
+.top-bar{position:sticky;top:0;background:#fff;padding:12px 0;display:flex;align-items:center;gap:20px;z-index:100;border-bottom:1px solid #f0f0f0}
+.top-bar-inner{display:flex;align-items:center;gap:20px;width:100%;max-width:1264px;margin:0 auto;padding:0 28px}
 .logo-small{font-size:26px;font-weight:700;cursor:pointer;user-select:none;flex-shrink:0;line-height:1}
 .logo-small span:nth-child(1){color:#4285f4}
 .logo-small span:nth-child(2){color:#ea4335}
@@ -41,8 +42,8 @@ body{font-family:arial,sans-serif;background:#fff;color:#202124;min-height:100vh
 .top-bar .search-box{flex:1;max-width:692px}
 .top-bar .search-box input{height:44px;font-size:16px}
 
-.results-container{max-width:652px;padding:16px 24px 40px 148px;margin:0 auto}
-@media(max-width:900px){.results-container{padding-left:24px}}
+.results-container{max-width:692px;margin:0 auto;padding:18px 0 40px 0}
+@media(max-width:900px){.results-container{padding-left:16px;padding-right:16px}}
 
 .stats{color:#70757a;font-size:12px;margin-bottom:16px;line-height:1.5}
 .result{margin-bottom:25px}
@@ -116,15 +117,17 @@ body{font-family:arial,sans-serif;background:#fff;color:#202124;min-height:100vh
 
 <div id="results-page">
   <div class="top-bar">
-    <div class="logo-small" id="home-btn">
-      <span>V</span><span>o</span><span>r</span><span>t</span><span>e</span><span>x</span>
+    <div class="top-bar-inner">
+      <div class="logo-small" id="home-btn">
+        <span>V</span><span>o</span><span>r</span><span>t</span><span>e</span><span>x</span>
+      </div>
+      <form class="search-box" id="form-top">
+        <input type="text" id="q-top">
+        <button type="submit" class="search-icon">
+          <svg viewBox="0 0 24 24"><path d="M15.5 14h-.79l-.28-.27A6.47 6.47 0 0016 9.5 6.5 6.5 0 109.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"/></svg>
+        </button>
+      </form>
     </div>
-    <form class="search-box" id="form-top">
-      <input type="text" id="q-top">
-      <button type="submit" class="search-icon">
-        <svg viewBox="0 0 24 24"><path d="M15.5 14h-.79l-.28-.27A6.47 6.47 0 0016 9.5 6.5 6.5 0 109.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"/></svg>
-      </button>
-    </form>
   </div>
   <div class="results-container">
     <div class="stats" id="stats"></div>
