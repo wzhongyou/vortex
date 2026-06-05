@@ -30,9 +30,9 @@ body{font-family:arial,sans-serif;background:#fff;color:#202124;min-height:100vh
 
 /* ── Results Page (搜索结果页) ─────────────────────── */
 #results-page{display:none;min-height:100vh}
-.top-bar{position:sticky;top:0;background:#fff;padding:12px 0;display:flex;align-items:center;gap:20px;z-index:100;border-bottom:1px solid #f0f0f0}
-.top-bar-inner{display:flex;align-items:center;gap:20px;width:100%;max-width:1264px;margin:0 auto;padding:0 28px}
-.logo-small{font-size:26px;font-weight:700;cursor:pointer;user-select:none;flex-shrink:0;line-height:1}
+.top-bar{position:sticky;top:0;background:#fff;z-index:100;border-bottom:1px solid #e8e8e8}
+.top-bar-inner{display:flex;align-items:center;gap:20px;max-width:1264px;margin:0 auto;padding:12px 24px}
+.logo-small{font-size:28px;font-weight:700;cursor:pointer;user-select:none;flex-shrink:0;line-height:1}
 .logo-small span:nth-child(1){color:#4285f4}
 .logo-small span:nth-child(2){color:#ea4335}
 .logo-small span:nth-child(3){color:#fbbc05}
@@ -42,20 +42,22 @@ body{font-family:arial,sans-serif;background:#fff;color:#202124;min-height:100vh
 .top-bar .search-box{flex:1;max-width:692px}
 .top-bar .search-box input{height:44px;font-size:16px}
 
-.results-container{max-width:692px;margin:0 auto;padding:18px 0 40px 0}
-@media(max-width:900px){.results-container{padding-left:16px;padding-right:16px}}
+.page-body{max-width:1264px;margin:0 auto;padding:0 24px}
+.results-container{max-width:692px;padding:18px 0 40px 0}
+@media(max-width:900px){.results-container{margin-left:0;padding:18px 16px 40px 16px}}
 
-.stats{color:#70757a;font-size:12px;margin-bottom:16px;line-height:1.5}
-.result{margin-bottom:25px}
-.result-cite{display:flex;align-items:center;gap:6px;margin-bottom:4px}
-.result-cite .favicon{width:16px;height:16px;border-radius:50%;background:#4285f4;color:#fff;font-size:9px;display:flex;align-items:center;justify-content:center;font-weight:700;flex-shrink:0}
-.result-cite .site{font-size:12px;color:#202124;line-height:1.3}
-.result-cite .site span{color:#70757a}
-.result-title a{color:#1a0dab;font-size:20px;text-decoration:none;line-height:1.3;cursor:pointer}
+.stats{color:#70757a;font-size:13px;margin-bottom:18px;line-height:1.5}
+.result{margin-bottom:28px}
+.result-cite{display:flex;align-items:center;gap:8px;margin-bottom:6px}
+.result-cite .favicon{width:26px;height:26px;border-radius:50%;background:#f1f3f4;color:#70757a;font-size:12px;display:flex;align-items:center;justify-content:center;font-weight:700;flex-shrink:0}
+.result-cite .site-info{display:flex;flex-direction:column;gap:1px;min-width:0}
+.result-cite .site-name{font-size:13px;color:#202124;line-height:1.3;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.result-cite .site-url{font-size:12px;color:#4d5156;line-height:1.3;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.result-title a{color:#1a0dab;font-size:20px;line-height:1.3;text-decoration:none;cursor:pointer}
 .result-title a:hover{text-decoration:underline}
-.result-snippet{color:#4d5156;font-size:14px;line-height:1.58;margin-top:3px}
-.result-meta{display:inline-flex;align-items:center;gap:6px;margin-left:8px;vertical-align:middle}
-.score-badge{font-size:11px;color:#70757a;background:#f1f3f4;padding:1px 6px;border-radius:3px}
+.result-snippet{color:#4d5156;font-size:14px;line-height:1.58;margin-top:4px}
+.result-meta{display:inline-flex;align-items:center;margin-left:8px;vertical-align:middle}
+.score-badge{font-size:11px;color:#70757a;background:#f1f3f4;padding:2px 7px;border-radius:10px;white-space:nowrap}
 .category-tag{font-size:12px;color:#1a0dab}
 
 /* ── Pagination (搜索分页) ──────────────────────────── */
@@ -129,10 +131,12 @@ body{font-family:arial,sans-serif;background:#fff;color:#202124;min-height:100vh
       </form>
     </div>
   </div>
-  <div class="results-container">
-    <div class="stats" id="stats"></div>
-    <div id="results-list"></div>
-    <div class="pagination" id="pagination"></div>
+  <div class="page-body">
+    <div class="results-container">
+      <div class="stats" id="stats"></div>
+      <div id="results-list"></div>
+      <div class="pagination" id="pagination"></div>
+    </div>
   </div>
 </div>
 
@@ -224,7 +228,10 @@ function renderResults(data) {
     <div class="result">
       <div class="result-cite">
         <div class="favicon">${esc(r.site || r.category || '').charAt(0).toUpperCase()}</div>
-        <div class="site">${esc(r.site || r.category || '')} <span>${esc(r.url || '')}</span></div>
+        <div class="site-info">
+          <div class="site-name">${esc(r.site || r.category || '')}</div>
+          <div class="site-url">${esc(r.url || '')}</div>
+        </div>
       </div>
       <div class="result-title">
         <a href="#" onclick="showDoc('${r.id}');return false">${esc(r.title)}</a>
