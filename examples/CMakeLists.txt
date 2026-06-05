@@ -7,4 +7,5 @@ if(VORTEX_BUILD_EXAMPLES)
         ${CMAKE_SOURCE_DIR}/include
         ${ROARING_INCLUDE_DIR}
     )
+    add_subdirectory(search_demo)
 endif()

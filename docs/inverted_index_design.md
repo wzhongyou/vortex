@@ -5,15 +5,17 @@
 > ⚠️ **设计与实现的差异：**
 > 实际实现做了以下简化和未完成项，阅读时请注意区分：
 >
+> **已实现的设计特性（原标注为未实现）：**
+> - `IndexReader::get_document()` — 已实现，通过 `.store` 正排文件按 external_id 检索存储字段
+> - `.store` 正排文件 — 已实现，段刷盘时写入 `_N.store`，存储 `stored=true` 的字段原始值
+>
 > **未实现的设计特性：**
 > - xxHash64 文件校验和 — 未写入也未验证
 > - 原子刷盘 tmp → rename 协议 — 直接写入最终文件
-> - `.store` 正排文件 — 未实现，段只写 `.fst/.doc/.fwd/.idm/.meta`
 > - SIMD 运行时调度 — `codec_init()` 从未被调用，实际固定使用 SSE4.2 路径
 > - WAL CRC32 校验 / 组提交 — WAL 实现简化，无 CRC32
 > - Roaring Bitmap 删除位图 — 实际使用 `std::vector<bool>`
 > - BM25F 每字段权重 — 实际只有全局 `{k1, b}` 参数
-> - `IndexReader::get_document()` — 不存在
 > - `ForwardIndexBuilder` — 类存在但未被实际使用
 >
 > **已做简化（降低外部依赖）：**
@@ -30,6 +32,7 @@
 |------|------|----------|
 | V1 | 初始 | 原始设计蓝图 |
 | V1.1 | 2026-05 | 精简内容，删除重复代码示例和过时章节；文件名去掉 V1 后缀 |
+| V1.2 | 2026-06 | 标注 `get_document()` 和 `.store` 正排存储已实现 |
 
 ## 1. 目标与范围
 
@@ -90,6 +93,7 @@ Segment N（刷盘后）：
 ├── _N.doc       倒排数据：[block_header][SIMD-packed deltas][freqs]
 ├── _N.fwd       前向索引：doc_id → {doc_length, field_lengths[]}
 ├── _N.idm       外部 ID 映射：internal_doc_id → external_id
+├── _N.store     正排存储：doc_id → {stored_field_values[]}（stored=true 的字段）
 ├── _N.meta      JSON 元数据
 └── _N.del       删除位图
 ```
@@ -342,7 +346,7 @@ struct Query {
 index_dir/
 ├── wal.log              ← 二进制 WAL
 ├── segments.manifest    ← 权威段列表（JSON）
-├── _0.fst / _0.doc / _0.fwd / _0.idm / _0.meta / _0.del
+├── _0.fst / _0.doc / _0.fwd / _0.idm / _0.store / _0.meta / _0.del
 ├── _1.fst / _1.doc / ...
 └── ...
 ```
