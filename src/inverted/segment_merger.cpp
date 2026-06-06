@@ -173,7 +173,8 @@ Result<std::shared_ptr<const Segment>> SegmentMerger::merge(
             Status::IOError("cannot create merged .idm"));
 
         uint32_t count = merged_doc_count;
-        (void)write(fd, &count, 4);
+        ssize_t _w0 = write(fd, &count, 4);
+        (void)_w0;
 
         for (auto& seg : segments) {
             // Read the segment's idm raw data (skip header count)
@@ -185,7 +186,7 @@ Result<std::shared_ptr<const Segment>> SegmentMerger::merge(
                 uint16_t slen;
                 std::memcpy(&slen, p, 2); p += 2; remaining -= 2;
                 if (remaining < slen) break;
-                (void)write(fd, p - 2, static_cast<size_t>(slen) + 2);  // len + data
+                ssize_t _w1 = write(fd, p - 2, static_cast<size_t>(slen) + 2); (void)_w1;  // len + data
                 p += slen; remaining -= slen;
             }
         }
@@ -200,8 +201,10 @@ Result<std::shared_ptr<const Segment>> SegmentMerger::merge(
 
         uint32_t dc = merged_doc_count;
         uint16_t sfc = stored_field_count;
-        (void)write(fd, &dc, 4);
-        (void)write(fd, &sfc, 2);
+        ssize_t _w0 = write(fd, &dc, 4);
+        (void)_w0;
+        ssize_t _w1 = write(fd, &sfc, 2);
+        (void)_w1;
 
         if (stored_field_count > 0) {
             for (auto& seg : segments) {
@@ -216,7 +219,8 @@ Result<std::shared_ptr<const Segment>> SegmentMerger::merge(
                         uint32_t vlen;
                         std::memcpy(&vlen, p, 4); p += 4; remaining -= 4;
                         if (remaining < vlen) break;
-                        (void)write(fd, p - 4, static_cast<size_t>(vlen) + 4);
+                        ssize_t _w2 = write(fd, p - 4, static_cast<size_t>(vlen) + 4);
+                        (void)_w2;
                         p += vlen; remaining -= vlen;
                     }
                 }
@@ -237,7 +241,8 @@ Result<std::shared_ptr<const Segment>> SegmentMerger::merge(
             << ",\"total_terms\":" << merged_total_terms
             << ",\"avgdl\":" << merged_avgdl << "}";
         std::string meta = oss.str();
-        (void)write(fd, meta.data(), meta.size());
+        ssize_t _w0 = write(fd, meta.data(), meta.size());
+        (void)_w0;
         close(fd);
     }
 
