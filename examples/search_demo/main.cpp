@@ -363,7 +363,7 @@ static std::vector<JsonDoc> parse_json_docs(const std::string& json) {
 // ── Main ───────────────────────────────────────────────────────────────────
 
 int main(int argc, char** argv) {
-    int port = 8080;
+    int port = 9527;
     std::string index_dir =
         (std::filesystem::temp_directory_path() / "vortex_search_demo").string();
     std::string import_file;

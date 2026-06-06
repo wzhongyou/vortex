@@ -77,7 +77,7 @@ cmake --build build -j$(sysctl -n hw.ncpu)
 ./build/examples/search_demo/vortex_search_demo --import examples/search_demo/sample_data.json
 ```
 
-浏览器打开 http://localhost:8080 即可搜索。
+浏览器打开 http://localhost:9527 即可搜索。
 
 **功能：**
 
@@ -92,7 +92,7 @@ cmake --build build -j$(sysctl -n hw.ncpu)
 
 | 参数         | 默认         | 说明                     |
 | ------------ | ------------ | ------------------------ |
-| `--port`   | 8080         | 监听端口                 |
+| `--port`   | 9527         | 监听端口                 |
 | `--dir`    | 系统临时目录 | 索引存储路径             |
 | `--import` | —           | 从 JSON 文件批量导入文档 |
 
