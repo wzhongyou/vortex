@@ -55,7 +55,7 @@ Status WAL::sync() {
 }
 
 Status WAL::truncate() {
-    if (fd_ >= 0) ftruncate(fd_, 0);
+    if (fd_ >= 0) (void)ftruncate(fd_, 0);
     bytes_written_ = 0;
     return Status::OK();
 }
@@ -73,7 +73,7 @@ Result<WAL::RecoveryState> WAL::recover(const Schema& schema) {
     if (file_size <= 0) {
         return Result<RecoveryState>::Ok(std::move(state));
     }
-    lseek(fd_, 0, SEEK_SET);
+    (void)lseek(fd_, 0, SEEK_SET);
 
     // Read entire file into buffer
     std::vector<uint8_t> buf(static_cast<size_t>(file_size));

@@ -249,7 +249,7 @@ Result<std::shared_ptr<const Segment>> MemorySegment::flush(
         int fd = open((seg_prefix + ".fst").c_str(), O_CREAT | O_RDWR | O_TRUNC, 0644);
         if (fd < 0) return Result<std::shared_ptr<const Segment>>::Err(
             Status::IOError("cannot create .fst"));
-        write(fd, fst_data.data(), fst_data.size());
+        (void)write(fd, fst_data.data(), fst_data.size());
         close(fd);
     }
 
@@ -258,7 +258,7 @@ Result<std::shared_ptr<const Segment>> MemorySegment::flush(
         int fd = open((seg_prefix + ".doc").c_str(), O_CREAT | O_RDWR | O_TRUNC, 0644);
         if (fd < 0) return Result<std::shared_ptr<const Segment>>::Err(
             Status::IOError("cannot create .doc"));
-        write(fd, posting_data.data(), posting_data.size());
+        (void)write(fd, posting_data.data(), posting_data.size());
         close(fd);
     }
 
@@ -270,15 +270,15 @@ Result<std::shared_ptr<const Segment>> MemorySegment::flush(
 
         uint32_t dc = doc_count_;
         uint16_t fc = indexed_field_count_;
-        write(fd, &dc, 4);
-        write(fd, &fc, 2);
+        (void)write(fd, &dc, 4);
+        (void)write(fd, &fc, 2);
 
         for (uint32_t i = 0; i < doc_count_; i++) {
             uint32_t dl = doc_lengths_[i];
-            write(fd, &dl, 4);
+            (void)write(fd, &dl, 4);
             for (uint16_t f = 0; f < fc; f++) {
                 uint32_t fl = f < field_lengths_[i].size() ? field_lengths_[i][f] : 0;
-                write(fd, &fl, 4);
+                (void)write(fd, &fl, 4);
             }
         }
         close(fd);
@@ -291,11 +291,11 @@ Result<std::shared_ptr<const Segment>> MemorySegment::flush(
             Status::IOError("cannot create .idm"));
 
         uint32_t count = static_cast<uint32_t>(external_ids_.size());
-        write(fd, &count, 4);
+        (void)write(fd, &count, 4);
         for (auto& ext_id : external_ids_) {
             uint16_t slen = static_cast<uint16_t>(ext_id.size());
-            write(fd, &slen, 2);
-            write(fd, ext_id.data(), slen);
+            (void)write(fd, &slen, 2);
+            (void)write(fd, ext_id.data(), slen);
         }
         close(fd);
     }
@@ -309,15 +309,15 @@ Result<std::shared_ptr<const Segment>> MemorySegment::flush(
         uint16_t sf_count = stored_values_.empty() ? 0
             : static_cast<uint16_t>(stored_values_[0].size());
         uint32_t dc = doc_count_;
-        write(fd, &dc, 4);
-        write(fd, &sf_count, 2);
+        (void)write(fd, &dc, 4);
+        (void)write(fd, &sf_count, 2);
         for (uint32_t i = 0; i < doc_count_; i++) {
             for (uint16_t f = 0; f < sf_count; f++) {
                 const std::string& v = (i < stored_values_.size() && f < stored_values_[i].size())
                     ? stored_values_[i][f] : empty_string;
                 uint32_t vlen = static_cast<uint32_t>(v.size());
-                write(fd, &vlen, 4);
-                if (vlen > 0) write(fd, v.data(), vlen);
+                (void)write(fd, &vlen, 4);
+                if (vlen > 0) (void)write(fd, v.data(), vlen);
             }
         }
         close(fd);
@@ -335,7 +335,7 @@ Result<std::shared_ptr<const Segment>> MemorySegment::flush(
             << ",\"total_terms\":" << total_terms_
             << ",\"avgdl\":" << avgdl << "}";
         std::string meta = oss.str();
-        write(fd, meta.data(), meta.size());
+        (void)write(fd, meta.data(), meta.size());
         close(fd);
     }
 

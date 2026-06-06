@@ -22,8 +22,9 @@ void ForwardIndexBuilder::append(uint32_t doc_length,
 Status ForwardIndexBuilder::flush(int fd) {
     // Header: doc_count (4B) + field_count (2B)
     uint32_t dc = doc_count_;
-    write(fd, &dc, 4);
-    write(fd, &field_count_, 2);
+    ssize_t w1 = write(fd, &dc, 4);
+    ssize_t w2 = write(fd, &field_count_, 2);
+    (void)w1; (void)w2;
 
     size_t data_size = buffer_.size() * sizeof(uint32_t);
     ssize_t written = write(fd, buffer_.data(), data_size);
