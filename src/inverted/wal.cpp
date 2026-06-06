@@ -67,8 +67,7 @@ Status WAL::sync() {
 }
 
 Status WAL::truncate() {
-    if (fd_ >= 0) ssize_t _w_ft = ftruncate(fd_, 0);
-    (void)_w_ft;
+    if (fd_ >= 0) { ssize_t r = ftruncate(fd_, 0); (void)r; }
     bytes_written_ = 0;
     return Status::OK();
 }
