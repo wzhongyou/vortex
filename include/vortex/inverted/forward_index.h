@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <vector>
 
 #include "vortex/core/result.h"
 #include "vortex/core/status.h"

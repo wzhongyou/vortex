@@ -1,7 +1,8 @@
 #pragma once
 
-#include <optional>
 #include <memory>
+#include <optional>
+#include <string_view>
 #include <vector>
 
 #include "vortex/core/document.h"

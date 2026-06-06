@@ -35,13 +35,15 @@ Status ExternalIdMap::flush(int fd, Arena& scratch) {
 
     // Binary format: [doc_count:u32][for each: id_len:u16, id:char[]]
     uint32_t count = static_cast<uint32_t>(entries.size());
-    write(fd, &count, 4);
+    ssize_t written = write(fd, &count, 4);
+    (void)written;
 
     std::vector<std::string> reverse(count);
     for (size_t i = 0; i < entries.size(); i++) {
         uint16_t len = static_cast<uint16_t>(entries[i].second.size());
-        write(fd, &len, 2);
-        write(fd, entries[i].second.data(), len);
+        ssize_t w1 = write(fd, &len, 2);
+        ssize_t w2 = write(fd, entries[i].second.data(), len);
+        (void)w1; (void)w2;
         reverse[entries[i].first] = entries[i].second;
     }
 
