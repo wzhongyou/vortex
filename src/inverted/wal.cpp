@@ -18,21 +18,30 @@ Status WAL::append_add(uint32_t internal_id, std::string_view external_id,
     if (fd_ < 0) return Status::IOError("WAL not open");
     // V1: simple binary format
     uint8_t op = 0x01;  // ADD
-    write(fd_, &op, 1);
-    write(fd_, &internal_id, 4);
+    ssize_t _w0 = write(fd_, &op, 1);
+    (void)_w0;
+    ssize_t _w1 = write(fd_, &internal_id, 4);
+    (void)_w1;
     uint16_t id_len = static_cast<uint16_t>(external_id.size());
-    write(fd_, &id_len, 2);
-    write(fd_, external_id.data(), id_len);
+    ssize_t _w2 = write(fd_, &id_len, 2);
+    (void)_w2;
+    ssize_t _w3 = write(fd_, external_id.data(), id_len);
+    (void)_w3;
     // Simplified: write field count + fields
     uint16_t fc = static_cast<uint16_t>(doc.fields.size());
-    write(fd_, &fc, 2);
+    ssize_t _w4 = write(fd_, &fc, 2);
+    (void)_w4;
     for (auto& f : doc.fields) {
         uint16_t nl = static_cast<uint16_t>(f.name.size());
-        write(fd_, &nl, 2);
-        write(fd_, f.name.data(), nl);
+        ssize_t _w5 = write(fd_, &nl, 2);
+        (void)_w5;
+        ssize_t _w6 = write(fd_, f.name.data(), nl);
+        (void)_w6;
         uint32_t vl = static_cast<uint32_t>(f.value.size());
-        write(fd_, &vl, 4);
-        write(fd_, f.value.data(), vl);
+        ssize_t _w7 = write(fd_, &vl, 4);
+        (void)_w7;
+        ssize_t _w8 = write(fd_, f.value.data(), vl);
+        (void)_w8;
     }
     bytes_written_ += 1 + 4 + 2 + id_len + 2;
     return Status::OK();
@@ -41,21 +50,25 @@ Status WAL::append_add(uint32_t internal_id, std::string_view external_id,
 Status WAL::append_remove(std::string_view external_id) {
     if (fd_ < 0) return Status::IOError("WAL not open");
     uint8_t op = 0x02;
-    write(fd_, &op, 1);
+    ssize_t _w9 = write(fd_, &op, 1);
+    (void)_w9;
     uint16_t id_len = static_cast<uint16_t>(external_id.size());
-    write(fd_, &id_len, 2);
-    write(fd_, external_id.data(), id_len);
+    ssize_t _w10 = write(fd_, &id_len, 2);
+    (void)_w10;
+    ssize_t _w11 = write(fd_, external_id.data(), id_len);
+    (void)_w11;
     bytes_written_ += 1 + 2 + id_len;
     return Status::OK();
 }
 
 Status WAL::sync() {
-    if (fd_ >= 0) fsync(fd_);
+    if (fd_ >= 0) { int r = fsync(fd_); (void)r; }
     return Status::OK();
 }
 
 Status WAL::truncate() {
-    if (fd_ >= 0) (void)ftruncate(fd_, 0);
+    if (fd_ >= 0) ssize_t _w_ft = ftruncate(fd_, 0);
+    (void)_w_ft;
     bytes_written_ = 0;
     return Status::OK();
 }
@@ -73,7 +86,8 @@ Result<WAL::RecoveryState> WAL::recover(const Schema& schema) {
     if (file_size <= 0) {
         return Result<RecoveryState>::Ok(std::move(state));
     }
-    (void)lseek(fd_, 0, SEEK_SET);
+    off_t seek_ret = lseek(fd_, 0, SEEK_SET);
+    (void)seek_ret;
 
     // Read entire file into buffer
     std::vector<uint8_t> buf(static_cast<size_t>(file_size));

@@ -64,7 +64,8 @@ Result<std::unique_ptr<ExternalIdMap>> ExternalIdMap::from_file(
         return Result<std::unique_ptr<ExternalIdMap>>::Ok(
             std::make_unique<ExternalIdMap>());
     }
-    (void)lseek(fd, 0, SEEK_SET);
+    off_t seek_ret = lseek(fd, 0, SEEK_SET);
+    (void)seek_ret;
 
     std::vector<uint8_t> buf(static_cast<size_t>(file_size));
     ssize_t n = read(fd, buf.data(), buf.size());
