@@ -8,11 +8,15 @@ namespace vortex::codec {
 DecodeFunc g_decode_block = decode_block;
 
 void codec_init() {
+// AVX2 解码器暂未启用：它期望 bit-plane 编码格式，但当前 encoder 输出的是顺序位压缩格式。
+// 等 encoder 也支持 bit-plane 布局、并用 header.flags 标记格式后再打开。
+#if 0
 #ifdef VORTEX_HAS_AVX2
     if (__builtin_cpu_supports("avx2")) {
         g_decode_block = decode_block_avx2;
         return;
     }
+#endif
 #endif
     g_decode_block = decode_block;
 }
